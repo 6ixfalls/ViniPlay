@@ -1,35 +1,24 @@
-/**
- * main.js
- *
- * Main entry point for the ViniPlay application.
- * Initializes the app by setting up authentication, event listeners, and loading initial data.
- */
+
 
 import { appState, guideState, UIElements } from './modules/state.js';
 import { apiFetch, fetchConfig, getDeviceSetting, saveDeviceSetting } from './modules/api.js'; // IMPORTED fetchConfig & device settings
-import { checkAuthStatus, setupAuthEventListeners } from './modules/auth.js';
+import { initializeApplication } from './modules/bootstrap.js';
 import { handleGuideLoad, finalizeGuideLoad, setupGuideEventListeners } from './modules/guide.js';
 //-- ENHANCEMENT: Import playChannel to handle the remote channel change event.
 import { setupPlayerEventListeners, playChannel, stopAndCleanupPlayer, shouldMaintainAspectRatio } from './modules/player.js';
-import { setupSettingsEventListeners, populateTimezoneSelector, updateUIFromSettings } from './modules/settings.js';
+
 // MODIFIED: Imported showBroadcastMessage
-import { makeModalResizable, handleRouteChange, switchTab, handleConfirm, closeModal, makeColumnResizable, openMobileMenu, closeMobileMenu, showNotification, showBroadcastMessage, updateProcessingStatus, showConfirm, refreshGuideAfterProcessing } from './modules/ui.js';
+import { makeModalResizable, handleRouteChange, switchTab, handleConfirm, closeModal, makeColumnResizable, openMobileMenu, closeMobileMenu, showNotification, showConfirm } from './modules/ui.js';
 // MODIFIED: Import navigateToProgramInGuide to handle deep links from notifications.
-import { loadAndScheduleNotifications, subscribeUserToPush, navigateToProgramInGuide } from './modules/notification.js';
-import { setupDvrEventListeners, handleDvrChannelClick, initDvrPage } from './modules/dvr.js';
+
 import { handleMultiViewChannelClick, populateChannelSelector, initMultiView } from './modules/multiview.js';
-import { setupDirectPlayerEventListeners, initDirectPlayer } from './modules/player_direct.js';
-import { initVodPage } from './modules/vod.js';
+
 import { ICONS } from './modules/icons.js'; // MODIFIED: Import the new icon library
-//-- ENHANCEMENT: Import the new handler for channel selector clicks from the admin page.
-import { initActivityPage, setupAdminEventListeners, handleActivityUpdate, handleAdminChannelClick } from './modules/admin.js';
-import { initTelemetry } from './modules/telemetry.js';
 
 // The initializeCastApi function is no longer called directly from here,
 // but the cast.js module will handle its own initialization via the window callback.
 
 // NEW: Global variable to hold navigation target from a notification click
-let notificationTarget = null;
 
 /**
  * NEW: Finds all icon placeholders in the document and injects the SVG markup.
@@ -58,138 +47,29 @@ function renderIcons() {
     });
 }
 
-
 /**
  * NEW: Connects to the server for real-time events using Server-Sent Events (SSE).
  * This allows the server to push updates to the client, such as invalidating a push subscription.
  */
 function initializeSse() {
-    console.log('[SSE] Initializing Server-Sent Events connection...');
-    const eventSource = new EventSource('/api/events');
-
-    eventSource.onopen = () => {
-        console.log('[SSE] Connection to server opened.');
-    };
-
-    eventSource.onerror = (error) => {
-        console.error('[SSE] EventSource failed:', error);
-        // The browser will automatically try to reconnect on its own.
-    };
-
-    // Listen for our custom 'subscription-invalidated' event from the server.
-    eventSource.addEventListener('subscription-invalidated', (event) => {
-        console.warn('[SSE] Received "subscription-invalidated" event from server.');
-        const data = JSON.parse(event.data);
-        console.log('[SSE] Invalid subscription details:', data);
-
-        // Show a non-error notification to the user that we are fixing things automatically.
-        showNotification('Notification subscription expired. Re-subscribing automatically...', false, 5000);
-
-        // Automatically trigger the re-subscription process. The `true` flag forces it to
-        // first unsubscribe the bad subscription from the browser before creating a new one.
-        subscribeUserToPush(true);
-    });
-
-    // NEW: Listen for real-time processing status updates
-    eventSource.addEventListener('processing-status', (event) => {
-        const data = JSON.parse(event.data);
-        // This function will be created in ui.js to update the modal
-        updateProcessingStatus(data.message, data.type);
-    });
-
-    // NEW: Listen for the 'force-logout' event
-    eventSource.addEventListener('force-logout', (event) => {
-        console.warn('[SSE] Received "force-logout" event from server.');
-        const data = JSON.parse(event.data);
-        showNotification(`Forced logout: ${data.reason}`, true, 5000);
-
-        // Wait a moment for the user to see the notification, then reload the page.
-        // This will trigger the auth check, which will fail, showing the login screen.
-        setTimeout(() => {
-            window.location.reload();
-        }, 3000);
-    });
-
-    //-- ENHANCEMENT: Listen for real-time activity updates for the admin dashboard.
-    eventSource.addEventListener('activity-update', (event) => {
-        const data = JSON.parse(event.data);
-        // This will only do something if the admin page is currently active.
-        if (window.location.pathname.startsWith('/activity')) {
-            handleActivityUpdate(data.live);
-        }
-    });
-
-    //-- ENHANCEMENT: Listen for the remote channel change command.
-    eventSource.addEventListener('change-channel', (event) => {
-        console.log('[SSE] Received "change-channel" command from admin.');
-        const { channel } = JSON.parse(event.data);
-
-        // Check which player is active and change its channel
-        const currentPage = window.location.pathname;
-        if (currentPage.startsWith('/tvguide') || currentPage === '/') {
-            // Stop the main player if it's open, then play the new channel.
-            stopAndCleanupPlayer().then(() => {
-                showNotification(`An administrator has changed your channel to: ${channel.name}`, false, 4000);
-                playChannel(channel.url, channel.name, channel.id);
-            });
-        }
-        // Note: For now, this doesn't affect Multi-View or the Direct Player page.
-        // This could be extended in the future if needed.
-    });
-
-    //-- NEW: Listen for remote stop stream command from admin.
-    eventSource.addEventListener('stop-stream', (event) => {
-        console.log('[SSE] Received "stop-stream" command from admin.');
-        let message = 'An administrator has stopped your stream.';
-        try {
-            const data = JSON.parse(event.data || '{}');
-            if (data.message) message = data.message;
-        } catch (e) {}
-        stopAndCleanupPlayer().then(() => {
-            showNotification(message, true, 5000);
-        });
-    });
-
-    // NEW: Listen for admin broadcast messages
-    eventSource.addEventListener('broadcast-message', (event) => {
-        console.log('[SSE] Received broadcast message from admin.');
-        const data = JSON.parse(event.data);
-        showBroadcastMessage(data.message);
-    });
-
-    // NEW: Listen for real-time DVR recording updates
-    eventSource.addEventListener('dvr-update', (event) => {
-        console.log('[SSE] Received "dvr-update" event from server.');
-        if (window.location.pathname.startsWith('/dvr')) {
-            initDvrPage();
+    const events = new EventSource('/api/events');
+    events.addEventListener('feeds-updated', async () => {
+        const config = await fetchConfig();
+        if (config) {
+            Object.assign(guideState.settings, config.settings);
+            await handleGuideLoad(config.m3uContent, config.epgContent);
         }
     });
 }
 
-
-/**
- * Initializes the main application after successful authentication.
- */
 export async function initMainApp() {
     console.log('[MAIN] Initializing main application...');
-    // 1. Initialize IndexedDB for caching
-    try {
-        appState.db = await openDB();
-        console.log('[MAIN] IndexedDB initialized successfully.');
-    } catch (e) {
-        console.error('[MAIN] Error initializing IndexedDB:', e);
-        showNotification("Could not initialize local cache. Data may not persist.", true);
-    }
-
     // 2. Setup all event listeners for the main app
     console.log('[MAIN] Setting up all event listeners...');
     setupCoreEventListeners();
     setupGuideEventListeners();
     setupPlayerEventListeners();
-    setupSettingsEventListeners();
-    setupDvrEventListeners();
-    setupDirectPlayerEventListeners();
-    setupAdminEventListeners(); // NEW: Setup admin event listeners
+
     // REMOVED: The direct call to initializeCastApi() is no longer needed here.
     // The cast.js module will now be initialized automatically by the Google Cast SDK callback.
     console.log('[MAIN] All event listeners set up.');
@@ -209,96 +89,21 @@ export async function initMainApp() {
         console.log('[MAIN] Configuration loaded:', config);
         Object.assign(guideState.settings, config.settings || {}); // Merge server settings into guideState
 
-        // --- NEW: Load VOD data into state ---
-        guideState.vodMovies = config.vodMovies || [];
-        guideState.vodSeries = config.vodSeries || [];
-        console.log(`[MAIN] Loaded ${guideState.vodMovies.length} movies and ${guideState.vodSeries.length} series episodes.`);
-
         // Restore UI dimensions from settings
         restoreDimensions();
         // Populate timezone selector and update other settings UI
-        populateTimezoneSelector();
-        updateUIFromSettings();
 
-        // Show initial loading indicator for guide (if not already handled by auth.js)
         UIElements.initialLoadingIndicator.classList.remove('hidden');
         UIElements.guidePlaceholder.classList.remove('hidden');
 
-        // FIX: Cache Validation Logic including User Permissions
-        const serverTimestamp = config.settings.sourcesLastUpdated;
-        const localTimestamp = await loadDataFromDB('sourcesLastUpdated');
-
-        // NEW: Check User Permission Signature to invalidate cache if permissions change
-        const serverUserSig = config.settings.userPermissionsSignature || 'default';
-        const localUserSig = await loadDataFromDB('userPermissionsSignature');
-
-        let useCache = false;
-
-        // Condition 1: Global Source Content hasn't changed
-        const sourceMatch = serverTimestamp && localTimestamp && serverTimestamp === localTimestamp;
-        // Condition 2: User Permissions haven't changed
-        const sigMatch = serverUserSig && localUserSig && serverUserSig === localUserSig;
-
-        if (sourceMatch && sigMatch) {
-            console.log('[MAIN_CACHE] Server/Local timestamps match AND User Permissions match. Using local cache.');
-            useCache = true;
+        if (config.m3uContent) {
+            await handleGuideLoad(config.m3uContent, config.epgContent);
         } else {
-            console.log(`[MAIN_CACHE] Cache invalid. SourceMatch: ${sourceMatch} (${serverTimestamp} vs ${localTimestamp}), SigMatch: ${sigMatch} (${serverUserSig} vs ${localUserSig}). Fetching fresh data.`);
-            useCache = false;
+            UIElements.initialLoadingIndicator.classList.add('hidden');
+            UIElements.noDataMessage.classList.remove('hidden');
         }
 
-        let loadedFromCache = false;
-        if (useCache) {
-            const cachedChannels = await loadDataFromDB('channels');
-            const cachedPrograms = await loadDataFromDB('programs');
-            if (cachedChannels?.length > 0 && cachedPrograms) {
-                console.log('[MAIN] Loaded guide data from cache. Finalizing guide load.');
-                guideState.channels = cachedChannels;
-                guideState.programs = cachedPrograms;
-                await finalizeGuideLoad(true); // true indicates first load
-                loadedFromCache = true;
-            }
-        }
-
-        // If we didn't use the cache or the cache was incomplete, load from server config.
-        if (!loadedFromCache) {
-            if (config.m3uContent) {
-                console.log('[MAIN] Processing guide data from server config.');
-                await handleGuideLoad(config.m3uContent, config.epgContent);
-                // After successfully loading from server, update the local timestamp and signature.
-                await saveDataToDB('sourcesLastUpdated', serverTimestamp);
-                await saveDataToDB('userPermissionsSignature', serverUserSig);
-                console.log('[MAIN_CACHE] Updated local timestamp and permission signature to match server.');
-            } else {
-                console.log('[MAIN] No M3U content from server or cache. Displaying no data message.');
-                UIElements.initialLoadingIndicator.classList.add('hidden');
-                UIElements.noDataMessage.classList.remove('hidden');
-            }
-        }
-
-        // Load the list of scheduled notifications for the UI
-        console.log('[MAIN] Loading and scheduling notifications...');
-        await loadAndScheduleNotifications();
-
-        // Subscribe to push notifications
-        console.log('[MAIN] Attempting to subscribe to push notifications...');
-        await subscribeUserToPush();
-        console.log('[MAIN] Push notification subscription process initiated.');
-
-        // MODIFICATION: If we have a notification target, navigate to it now that the guide is loaded.
-        // Otherwise, handle the regular route change.
-        if (notificationTarget) {
-            console.log('[MAIN] App initialized. Executing deferred navigation to notification target.');
-            await navigateToProgramInGuide(notificationTarget.channelId, notificationTarget.programStart, notificationTarget.programId);
-            // Clean up to prevent re-triggering on refresh
-            notificationTarget = null;
-            // Clean the URL
-            window.history.replaceState({}, document.title, window.location.pathname);
-        } else {
-            // Handle initial route based on URL
-            console.log('[MAIN] Handling initial route change.');
-            handleRouteChange();
-        }
+        handleRouteChange();
 
         // NEW: Connect to the server for real-time events like notification updates.
         initializeSse();
@@ -309,95 +114,13 @@ export async function initMainApp() {
         showNotification("Initialization failed: " + e.message, true);
         UIElements.initialLoadingIndicator.classList.add('hidden');
         UIElements.noDataMessage.classList.remove('hidden'); // Ensure no data message is shown
-        switchTab('settings'); // Suggest going to settings to add sources
+
     }
 }
 
 /**
- * Opens and sets up the IndexedDB database.
+ * Restores presentation preferences.
  */
-function openDB() {
-    return new Promise((resolve, reject) => {
-        const request = indexedDB.open('ViniPlayDB_v3', 1); // Increment version for schema changes
-        request.onerror = (event) => {
-            console.error('[IndexedDB] Error opening database:', event.target.errorCode);
-            reject("Error opening IndexedDB.");
-        };
-        request.onsuccess = (event) => {
-            const dbInstance = event.target.result;
-            console.log('[IndexedDB] Database opened successfully.');
-            resolve(dbInstance);
-        };
-        request.onupgradeneeded = (event) => {
-            console.log('[IndexedDB] Database upgrade needed. Old version:', event.oldVersion, 'New version:', event.newVersion);
-            const dbInstance = event.target.result;
-            if (!dbInstance.objectStoreNames.contains('guideData')) {
-                dbInstance.createObjectStore('guideData');
-                console.log('[IndexedDB] Created "guideData" object store.');
-            }
-            // Add any future schema upgrades here
-        };
-    });
-}
-
-/**
- * Loads data from IndexedDB.
- */
-async function loadDataFromDB(key) {
-    if (!appState.db) {
-        console.warn('[IndexedDB] Cannot load data: DB instance is null.');
-        return null;
-    }
-    return new Promise((resolve, reject) => {
-        try {
-            const transaction = appState.db.transaction(['guideData'], 'readonly');
-            const store = transaction.objectStore('guideData');
-            const request = store.get(key);
-            request.onsuccess = () => {
-                if (request.result) {
-                    console.log(`[IndexedDB] Data for key "${key}" loaded from cache.`);
-                } else {
-                    console.log(`[IndexedDB] No data found for key "${key}" in cache.`);
-                }
-                resolve(request.result);
-            };
-            request.onerror = (event) => {
-                console.error(`[IndexedDB] Error loading data for key "${key}" from DB:`, event.target.error);
-                reject("Error loading data from DB.");
-            };
-        } catch (e) {
-            console.error(`[IndexedDB] Unexpected error during loadDataFromDB for key "${key}":`, e);
-            reject(e);
-        }
-    });
-}
-
-// FIX: New function to save data to IndexedDB
-async function saveDataToDB(key, value) {
-    if (!appState.db) {
-        console.warn('[IndexedDB] Cannot save data: DB instance is null.');
-        return false;
-    }
-    return new Promise((resolve, reject) => {
-        try {
-            const transaction = appState.db.transaction(['guideData'], 'readwrite');
-            const store = transaction.objectStore('guideData');
-            const request = store.put(value, key);
-            request.onsuccess = () => {
-                console.log(`[IndexedDB] Data for key "${key}" saved successfully.`);
-                resolve(true);
-            };
-            request.onerror = (event) => {
-                console.error(`[IndexedDB] Error saving data for key "${key}" to DB:`, event.target.error);
-                reject(false);
-            };
-        } catch (e) {
-            console.error(`[IndexedDB] Unexpected error during saveDataToDB for key "${key}":`, e);
-            reject(false);
-        }
-    });
-}
-
 /**
  * Restores the dimensions of resizable modals and the channel column from saved device settings.
  */
@@ -464,12 +187,8 @@ function setupCoreEventListeners() {
     // Desktop Tabs
     setupTabListener(UIElements.tabGuide, 'guide');
     setupTabListener(UIElements.tabMultiview, 'multiview', initMultiView);
-    setupTabListener(UIElements.tabPlayer, 'player', initDirectPlayer);
-    setupTabListener(UIElements.tabDvr, 'dvr', initDvrPage);
-    setupTabListener(UIElements.tabVod, 'vod', initVodPage);
-    setupTabListener(UIElements.tabActivity, 'activity', initActivityPage); // NEW
-    setupTabListener(UIElements.tabNotifications, 'notifications', loadAndScheduleNotifications);
-    setupTabListener(UIElements.tabSettings, 'settings');
+
+     // NEW
 
     // Mobile Navigation
     UIElements.mobileMenuToggle?.addEventListener('click', openMobileMenu);
@@ -478,36 +197,13 @@ function setupCoreEventListeners() {
 
     UIElements.mobileNavGuide?.addEventListener('click', () => switchTab('guide'));
     UIElements.mobileNavMultiview?.addEventListener('click', () => switchTab('multiview'));
-    UIElements.mobileNavPlayer?.addEventListener('click', () => switchTab('player'));
-    UIElements.mobileNavDvr?.addEventListener('click', () => switchTab('dvr'));
-    UIElements.mobileNavVod?.addEventListener('click', () => switchTab('vod'));
-    UIElements.mobileNavActivity?.addEventListener('click', () => switchTab('activity')); // NEW
-    UIElements.mobileNavNotifications?.addEventListener('click', () => switchTab('notifications'));
-    UIElements.mobileNavSettings?.addEventListener('click', () => switchTab('settings'));
 
-    UIElements.mobileNavLogoutBtn?.addEventListener('click', () => {
-        const logoutButton = document.getElementById('logout-btn');
-        if (logoutButton) logoutButton.click();
-        closeMobileMenu();
-    });
+     // NEW
 
     // --- Browser and Document Listeners ---
     window.addEventListener('popstate', () => { console.log('[NAV] Popstate event (browser back/forward).'); handleRouteChange(); });
 
     // NEW: Refresh data when tab becomes visible again
-    document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') {
-            console.log('[MAIN] Tab is visible again, refreshing data for current page.');
-            const currentPage = window.location.pathname;
-            if (currentPage.startsWith('/dvr')) {
-                initDvrPage();
-            } else if (currentPage.startsWith('/notifications')) {
-                loadAndScheduleNotifications();
-            } else if (currentPage.startsWith('/activity')) { // NEW
-                initActivityPage();
-            }
-        }
-    });
 
     // --- Modal Listeners ---
     UIElements.confirmCancelBtn?.addEventListener('click', () => closeModal(UIElements.confirmModal));
@@ -529,13 +225,7 @@ function setupCoreEventListeners() {
         const context = document.body.dataset.channelSelectorContext;
         console.log(`[CHANNEL_SELECTOR] Click handled with context: ${context}`);
 
-        if (context === 'dvr') {
-            handleDvrChannelClick(channelItem);
-        } else if (context === 'admin') {
-            handleAdminChannelClick(channelItem);
-        } else { // Default to multiview
-            handleMultiViewChannelClick(channelItem);
-        }
+        handleMultiViewChannelClick(channelItem);
 
         // Clean up the context after use
         delete document.body.dataset.channelSelectorContext;
@@ -588,63 +278,13 @@ function setupCoreEventListeners() {
     }
 
     // monitor the processes of channel sources
-    document.addEventListener('background-process-finished', () => {
-        console.log('[MAIN] Detected background process has finished.');
-        showConfirm(
-            'Sources Processed',
-            'Your sources have finished processing in the background. Would you like to update the TV Guide now?',
-            refreshGuideAfterProcessing // The callback function to execute on confirm
-        );
-    });
-}
 
+}
 
 // --- App Start ---
 document.addEventListener('DOMContentLoaded', () => {
-    initTelemetry();
-    // NEW: Check for notification deep link parameters on initial load.
-    const urlParams = new URLSearchParams(window.location.search);
-    const channelId = urlParams.get('channelId');
-    const programId = urlParams.get('programId');
-    const programStart = urlParams.get('programStart');
-
-    if (channelId && programId && programStart) {
-        console.log('[MAIN] Notification deep link detected. Storing target:', { channelId, programId, programStart });
-        notificationTarget = { channelId, programId, programStart };
-    }
-
-    // PWA Launch Handler: ensure app focuses without re-navigating or reloading when tapped from home screen
-    if ('launchQueue' in window) {
-        window.launchQueue.setConsumer((launchParams) => {
-            console.log('[PWA_LAUNCH] App focused from OS/launcher without reload:', launchParams?.targetURL);
-        });
-    }
-
-    // Register Service Worker
-    if ('serviceWorker' in navigator && 'PushManager' in window) {
-        console.log('[APP_START] Service Worker and Push API are supported by browser.');
-        navigator.serviceWorker.register('/sw.js')
-            .then(swReg => {
-                console.log('[APP_START] Service Worker registered successfully:', swReg);
-                appState.swRegistration = swReg;
-                // The following function is now INSIDE the .then() block
-                // This ensures it only runs after the service worker is ready.
-                return subscribeUserToPush();
-            })
-            .then(() => {
-                console.log('[MAIN] Push notification subscription process initiated after SW registration.');
-            })
-            .catch(error => {
-                console.error('[APP_START] Service Worker registration or Push Subscription failed:', error);
-                showNotification('Failed to set up notifications.', true);
-            });
-    } else {
-        console.warn('[APP_START] Push messaging is not supported in this browser environment.');
-        showNotification('Push notifications are not supported by your browser.', false, 5000);
-    }
-
-    console.log('[APP_START] Setting up authentication event listeners...');
-    setupAuthEventListeners();
-    console.log('[APP_START] Checking authentication status...');
-    checkAuthStatus(); // This initiates the main app flow
+    navigator.serviceWorker?.getRegistration('/').then(registration => {
+        if (registration?.active?.scriptURL === new URL('/sw.js', location.origin).href) registration.unregister();
+    }).catch(() => {});
+    initializeApplication();
 });

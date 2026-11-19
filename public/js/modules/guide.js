@@ -6,13 +6,12 @@
  * REFACTORED to use UI Virtualization for high-performance rendering of large channel lists.
  */
 
-import { appState, guideState, UIElements, dvrState } from './state.js';
-import { saveUserSetting, getDeviceSetting, saveDeviceSetting } from './api.js';
+import { appState, guideState, UIElements } from './state.js';
+import { savePreference, getDeviceSetting, saveDeviceSetting } from './api.js';
 import { parseM3U, formatTimeWithOffset } from './utils.js';
 import { playChannel } from './player.js';
 import { showNotification, openModal, closeModal } from './ui.js';
-import { addOrRemoveNotification, findNotificationForProgram } from './notification.js';
-import { addOrRemoveDvrJob, findDvrJobForProgram } from './dvr.js';
+
 import { ICONS } from './icons.js'; // MODIFIED: Import the new icon library
 
 // --- Virtualization Constants ---
@@ -64,8 +63,6 @@ export function openProgramDetails(progItem) {
     const detailsTime = programDetailsModal.querySelector('#details-time');
     const detailsDesc = programDetailsModal.querySelector('#details-desc');
     const detailsPlayBtn = programDetailsModal.querySelector('#details-play-btn');
-    const programDetailsNotifyBtn = programDetailsModal.querySelector('#program-details-notify-btn');
-    const programDetailsRecordBtn = programDetailsModal.querySelector('#details-record-btn');
     const detailsCloseBtn = programDetailsModal.querySelector('#details-close-btn');
     const detailsFavoriteBtn = programDetailsModal.querySelector('#details-favorite-btn');
 
@@ -107,7 +104,7 @@ export function openProgramDetails(progItem) {
             }
 
             guideState.settings.favorites = guideState.channels.filter(c => c.isFavorite).map(c => c.id);
-            saveUserSetting('favorites', guideState.settings.favorites);
+            savePreference('favorites', guideState.settings.favorites);
 
             if (UIElements.groupFilter.value === 'favorites') {
                 handleSearchAndFilter(false, true);
@@ -119,103 +116,8 @@ export function openProgramDetails(progItem) {
     const programStopTime = new Date(programData.stop).getTime();
     const isProgramRelevant = programStopTime > now.getTime();
 
-    // --- Notification Button Logic ---
-    if (programDetailsNotifyBtn) {
-        const notification = findNotificationForProgram(programData, channelId);
-        if (isProgramRelevant) {
-            programDetailsNotifyBtn.classList.remove('hidden');
-            programDetailsNotifyBtn.textContent = notification ? 'Notification Set' : 'Notify Me';
-            programDetailsNotifyBtn.disabled = !notification && Notification.permission === 'denied';
-            programDetailsNotifyBtn.classList.toggle('bg-yellow-600', !notification);
-            programDetailsNotifyBtn.classList.toggle('hover:bg-yellow-700', !notification);
-            programDetailsNotifyBtn.classList.toggle('bg-gray-600', !!notification);
-            programDetailsNotifyBtn.classList.toggle('hover:bg-gray-500', !!notification);
-
-            programDetailsNotifyBtn.onclick = async () => {
-                await addOrRemoveNotification({
-                    id: notification ? notification.id : null,
-                    channelId: programData.channelId,
-                    channelName: channelName,
-                    channelLogo: channelLogo,
-                    programTitle: programData.title,
-                    programStart: programData.start,
-                    programStop: programData.stop,
-                    programDesc: programData.desc,
-                    programId: programData.programId
-                });
-                const updatedNotification = findNotificationForProgram(programData, channelId);
-                programDetailsNotifyBtn.textContent = updatedNotification ? 'Notification Set' : 'Notify Me';
-                programDetailsNotifyBtn.classList.toggle('bg-yellow-600', !updatedNotification);
-                programDetailsNotifyBtn.classList.toggle('hover:bg-yellow-700', !updatedNotification);
-                programDetailsNotifyBtn.classList.toggle('bg-gray-600', !!updatedNotification);
-                programDetailsNotifyBtn.classList.toggle('hover:bg-gray-500', !!updatedNotification);
-                handleSearchAndFilter(false, true);
-            };
-        } else {
-            programDetailsNotifyBtn.classList.add('hidden');
-        }
-    }
-
-    // --- DVR Record Button Logic (with permission check) ---
-    const hasDvrAccess = appState.currentUser?.isAdmin || appState.currentUser?.canUseDvr;
-    if (programDetailsRecordBtn && hasDvrAccess) {
-        const dvrJob = findDvrJobForProgram(programData);
-
-        if (isProgramRelevant) {
-            programDetailsRecordBtn.classList.remove('hidden');
-
-            let buttonText = 'Record';
-            let buttonClass = 'bg-red-600';
-            let hoverClass = 'hover:bg-red-700';
-            let isDisabled = false;
-
-            if (dvrJob) {
-                switch (dvrJob.status) {
-                    case 'scheduled':
-                        buttonText = 'Cancel Recording';
-                        buttonClass = 'bg-gray-600';
-                        hoverClass = 'hover:bg-gray-500';
-                        break;
-                    case 'recording':
-                        buttonText = 'Recording...';
-                        buttonClass = 'bg-red-800';
-                        hoverClass = 'hover:bg-red-800';
-                        isDisabled = true;
-                        break;
-                    case 'completed':
-                    case 'error':
-                        buttonText = dvrJob.status === 'completed' ? 'Recorded' : 'Error';
-                        buttonClass = dvrJob.status === 'completed' ? 'bg-green-600' : 'bg-orange-600';
-                        hoverClass = dvrJob.status === 'completed' ? 'hover:bg-green-600' : 'hover:bg-orange-600';
-                        isDisabled = true;
-                        break;
-                }
-            }
-
-            programDetailsRecordBtn.textContent = buttonText;
-            programDetailsRecordBtn.className = `font-bold py-2 px-4 rounded-md transition-colors ${buttonClass} ${hoverClass} text-white`;
-            programDetailsRecordBtn.disabled = isDisabled;
-
-            programDetailsRecordBtn.onclick = async () => {
-                await addOrRemoveDvrJob(programData);
-                closeModal(programDetailsModal);
-                handleSearchAndFilter(false, true);
-            };
-
-        } else {
-            programDetailsRecordBtn.classList.add('hidden');
-        }
-    } else if (programDetailsRecordBtn) {
-        programDetailsRecordBtn.classList.add('hidden');
-    }
-
-    if (detailsCloseBtn) {
-        detailsCloseBtn.onclick = () => closeModal(programDetailsModal);
-    }
-
     openModal(programDetailsModal);
 }
-
 
 // --- Data Loading and Processing ---
 
@@ -236,11 +138,6 @@ export async function handleGuideLoad(m3uContent, epgContent, shouldCenter = fal
         guideState.programs = epgContent || {};
     }
 
-    if (appState.db) {
-        await appState.db.transaction(['guideData'], 'readwrite').objectStore('guideData').put(guideState.channels, 'channels');
-        await appState.db.transaction(['guideData'], 'readwrite').objectStore('guideData').put(guideState.programs, 'programs');
-    }
-
     console.log('[GUIDE_LOAD_DEBUG] About to call finalizeGuideLoad with shouldCenter:', shouldCenter);
     return finalizeGuideLoad(shouldCenter);
 }
@@ -256,7 +153,6 @@ const formatDateForInput = (date) => {
     const day = date.getDate().toString().padStart(2, '0');
     return `${year}-${month}-${day}`;
 };
-
 
 /**
  * Scans all programs to determine the earliest start date and latest end date.
@@ -285,7 +181,6 @@ const getEpgDateRange = () => {
 
     return { minDate, maxDate };
 };
-
 
 /**
  * Finalizes the guide setup after data is loaded from any source (API or cache).
@@ -321,7 +216,6 @@ export function finalizeGuideLoad(shouldCenter = false) {
     } else if (UIElements.guideDatePicker) {
         UIElements.guideDatePicker.disabled = true;
     }
-
 
     const allPrograms = [];
     const guideStart = new Date(guideState.currentDate);
@@ -397,7 +291,6 @@ const renderGuide = (channelsToRender, resetScroll = false, shouldCenter = false
             selectedDate.getDate(),
             0, 0, 0, 0
         ) - offsetMs); // Shift back by timezone offset to align with EPG data
-
 
         const timelineWidth = guideState.guideDurationHours * guideState.hourWidthPixels;
         UIElements.guideGrid.style.setProperty('--timeline-width', `${timelineWidth}px`);
@@ -561,15 +454,9 @@ const renderGuide = (channelsToRender, resetScroll = false, shouldCenter = false
 
                     const uniqueProgramId = `${channel.id}-${progStart.toISOString()}-${progStop.toISOString()}`;
 
-                    const hasNotification = findNotificationForProgram({ ...prog, programId: uniqueProgramId }, channel.id);
-                    const notificationClass = hasNotification ? 'has-notification' : '';
-
-                    const dvrJob = findDvrJobForProgram({ ...prog, channelId: channel.id });
-                    const recordingClass = dvrJob ? `has-recording status-${dvrJob.status}` : '';
-
                     const offset = guideState.settings.timezoneOffset || 0;
 
-                    programsHTML += `<div class="programme-item absolute top-1 bottom-1 bg-gray-800 rounded-md p-2 overflow-hidden flex flex-col justify-center z-5 ${isLive ? 'live' : ''} ${progStop < now ? 'past' : ''} ${notificationClass} ${recordingClass}" style="left:${left}px; width:${Math.max(0, width - 2)}px" data-channel-url="${channel.url}" data-channel-id="${channel.id}" data-channel-name="${channelName}" data-prog-title="${prog.title}" data-prog-desc="${prog.desc}" data-prog-start="${progStart.toISOString()}" data-prog-stop="${progStop.toISOString()}" data-prog-id="${uniqueProgramId}"><div class="programme-progress" style="width:${progressWidth}%"></div><p class="prog-title text-white font-semibold truncate relative z-10">${prog.title}</p><p class="prog-time text-gray-400 truncate relative z-10">${formatTimeWithOffset(progStart, offset)} - ${formatTimeWithOffset(progStop, offset)}</p></div>`;
+                    programsHTML += `<div class="programme-item absolute top-1 bottom-1 bg-gray-800 rounded-md p-2 overflow-hidden flex flex-col justify-center z-5 ${isLive ? 'live' : ''} ${progStop < now ? 'past' : ''}" style="left:${left}px; width:${Math.max(0, width - 2)}px" data-channel-url="${channel.url}" data-channel-id="${channel.id}" data-channel-name="${channelName}" data-prog-title="${prog.title}" data-prog-desc="${prog.desc}" data-prog-start="${progStart.toISOString()}" data-prog-stop="${progStop.toISOString()}" data-prog-id="${uniqueProgramId}"><div class="programme-progress" style="width:${progressWidth}%"></div><p class="prog-title text-white font-semibold truncate relative z-10">${prog.title}</p><p class="prog-time text-gray-400 truncate relative z-10">${formatTimeWithOffset(progStart, offset)} - ${formatTimeWithOffset(progStop, offset)}</p></div>`;
                 });
                 const timelineRowHTML = `<div class="timeline-row" style="width: ${timelineWidth}px;">${programsHTML}</div>`;
 
@@ -703,7 +590,7 @@ export const updateNowLinePosition = () => {
 };
 
 // --- Filtering and Searching ---
- 
+
 /**
  * Populates the "source" filter dropdown.
  */
@@ -826,7 +713,7 @@ export function handleSearchAndFilter(shouldCenter = false, preserveScroll = fal
         }
 
         // BUG FIX: Include channels from both channel search AND program search
-        // This ensures that searching for program titles (e.g., "Shark Tank") 
+        // This ensures that searching for program titles (e.g., "Shark Tank")
         // will display all channels that have matching programs, not just channels
         // whose names match the search term.
         const channelIdsFromChannelSearch = new Set(channelResults.map(r => r.item.id));
@@ -1034,7 +921,7 @@ export function setupGuideEventListeners() {
             favoriteStar.classList.toggle('favorited', channel.isFavorite);
 
             guideState.settings.favorites = guideState.channels.filter(c => c.isFavorite).map(c => c.id);
-            saveUserSetting('favorites', guideState.settings.favorites);
+            savePreference('favorites', guideState.settings.favorites);
 
             if (UIElements.groupFilter.value === 'favorites') {
                 handleSearchAndFilter();

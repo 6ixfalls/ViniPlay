@@ -5,7 +5,7 @@
  */
 
 import { appState, guideState, UIElements } from './state.js';
-import { apiFetch, stopStream, startRedirectStream, stopRedirectStream, sendRedirectHeartbeat } from './api.js';
+import { savePreference, stopStream } from "./api.js";
 import { showNotification, openModal, closeModal, showConfirm } from './ui.js';
 import { ICONS } from './icons.js';
 
@@ -18,55 +18,6 @@ let lastLayoutBeforeHide = null; // To store layout when tab is hidden
 let immersiveHeaderTimeout = null; // NEW: Timer for immersive mode header
 
 const MAX_PLAYERS = 9;
-const redirectHistoryIds = new Map(); // To track redirect streams for logging
-let multiviewHeartbeatInterval = null; // NEW: Heartbeat timer for multiview redirect streams
-
-/**
- * Starts periodic 30s heartbeats for all active redirect streams in MultiView.
- */
-function startMultiviewHeartbeats() {
-    if (multiviewHeartbeatInterval) return;
-    multiviewHeartbeatInterval = setInterval(async () => {
-        if (redirectHistoryIds.size === 0) {
-            clearInterval(multiviewHeartbeatInterval);
-            multiviewHeartbeatInterval = null;
-            return;
-        }
-        for (const [widgetId, historyId] of redirectHistoryIds.entries()) {
-            await sendRedirectHeartbeat(historyId);
-        }
-    }, 30000);
-}
-
-/**
- * Stops the multiview heartbeat timer if no redirect streams are active.
- */
-function checkAndStopMultiviewHeartbeats() {
-    if (redirectHistoryIds.size === 0 && multiviewHeartbeatInterval) {
-        clearInterval(multiviewHeartbeatInterval);
-        multiviewHeartbeatInterval = null;
-    }
-}
-
-// Unload handlers to cleanly stop all active redirect streams in MultiView on tab/browser close
-const handleMultiviewUnload = () => {
-    for (const historyId of redirectHistoryIds.values()) {
-        stopRedirectStream(historyId, true);
-    }
-};
-window.addEventListener('pagehide', handleMultiviewUnload);
-window.addEventListener('beforeunload', handleMultiviewUnload);
-
-/**
- * Detects if a URL is a VOD file by checking for file extensions.
- * @param {string} url - The stream URL to check
- * @returns {boolean} True if URL appears to be a VOD file
- */
-function isVODFile(url) {
-    const vodExtensions = ['.mkv', '.mp4', '.avi', '.mov', '.m4v', '.flv', '.wmv', '.mpg', '.mpeg', '.webm'];
-    const lowerUrl = url.toLowerCase();
-    return vodExtensions.some(ext => lowerUrl.includes(ext));
-}
 
 /**
  * NEW: A less aggressive cleanup function specifically for when the tab is hidden.
@@ -123,7 +74,6 @@ async function pauseAndClearAllPlayers() {
     }
 }
 
-
 /**
  * Handles the visibility change of the tab to prevent crashes.
  */
@@ -161,7 +111,6 @@ const handleVisibilityChange = async () => {
         }
     }
 };
-
 
 /**
  * Initializes the Multi-View page, sets up the grid and event listeners.
@@ -217,12 +166,7 @@ export async function cleanupMultiView() {
     }
     players.clear();
     playerUrls.clear();
-    // Stop any active redirect logging sessions
-    for (const historyId of redirectHistoryIds.values()) {
-        stopRedirectStream(historyId);
-    }
-    redirectHistoryIds.clear();
-    checkAndStopMultiviewHeartbeats();
+
     activePlayerId = null;
     channelSelectorCallback = null;
     lastLayoutBeforeHide = null; // A full cleanup should clear this
@@ -279,7 +223,6 @@ function handleImmersiveHeaderOverlay(e) {
     }
 }
 
-
 /**
  * Sets up global event listeners for the Multi-View page controls.
  */
@@ -296,68 +239,8 @@ function setupMultiViewEventListeners() {
     UIElements.saveLayoutCancelBtn.addEventListener('click', () => closeModal(UIElements.saveLayoutModal));
 
     // --- NEW: Custom URL Tab Switching ---
-    UIElements.multiviewSourceListBtn?.addEventListener('click', () => {
-        UIElements.multiviewSourceListBtn.classList.add('bg-gray-700', 'text-white', 'font-medium');
-        UIElements.multiviewSourceListBtn.classList.remove('text-gray-300');
-        UIElements.multiviewSourceCustomBtn.classList.remove('bg-gray-700', 'text-white', 'font-medium');
-        UIElements.multiviewSourceCustomBtn.classList.add('text-gray-300');
-
-        // Show channel list elements
-        UIElements.channelSelectorList.classList.remove('hidden');
-        UIElements.channelSelectorSearch.classList.remove('hidden');
-        // Show the filter dropdown container (parent of the select and h3)
-        const filterContainer = UIElements.multiviewChannelFilter.closest('.flex.justify-between');
-        if (filterContainer) filterContainer.classList.remove('hidden');
-
-        // Hide custom URL container
-        UIElements.multiviewCustomUrlContainer.classList.add('hidden');
-    });
-
-    UIElements.multiviewSourceCustomBtn?.addEventListener('click', () => {
-        UIElements.multiviewSourceCustomBtn.classList.add('bg-gray-700', 'text-white', 'font-medium');
-        UIElements.multiviewSourceCustomBtn.classList.remove('text-gray-300');
-        UIElements.multiviewSourceListBtn.classList.remove('bg-gray-700', 'text-white', 'font-medium');
-        UIElements.multiviewSourceListBtn.classList.add('text-gray-300');
-
-        // Hide channel list elements
-        UIElements.channelSelectorList.classList.add('hidden');
-        UIElements.channelSelectorSearch.classList.add('hidden');
-        // Hide the filter dropdown container (parent of the select and h3)
-        const filterContainer = UIElements.multiviewChannelFilter.closest('.flex.justify-between');
-        if (filterContainer) filterContainer.classList.add('hidden');
-
-        // Show custom URL container
-        UIElements.multiviewCustomUrlContainer.classList.remove('hidden');
-    });
 
     // --- NEW: Handle custom URL play button ---
-    UIElements.multiviewCustomUrlPlayBtn?.addEventListener('click', () => {
-        const url = UIElements.multiviewCustomUrlInput.value.trim();
-        const name = UIElements.multiviewCustomNameInput.value.trim() || 'Custom Stream';
-
-        if (!url) {
-            showNotification('Please enter a stream URL', true);
-            return;
-        }
-
-        // Create a temporary channel object
-        const customChannel = {
-            id: `custom-${Date.now()}`,
-            name: name,
-            url: url,
-            logo: 'https://placehold.co/40x40/1f2937/d1d5db?text=URL'
-        };
-
-        // Call the callback (same as clicking a channel from list)
-        if (channelSelectorCallback) {
-            channelSelectorCallback(customChannel);
-            closeModal(UIElements.multiviewChannelSelectorModal);
-
-            // Clear inputs
-            UIElements.multiviewCustomUrlInput.value = '';
-            UIElements.multiviewCustomNameInput.value = '';
-        }
-    });
 
     // --- NEW: Immersive Mode Event Listeners ---
     const immersiveToggle = document.getElementById('immersive-mode-toggle');
@@ -470,7 +353,6 @@ async function removeLastPlayer() {
         showNotification("No players to remove.", false);
     }
 }
-
 
 /**
  * Applies a predefined layout to the player grid.
@@ -699,79 +581,12 @@ async function playChannelInWidget(widgetId, channel, gridstackItemContentEl) {
     const settings = guideState.settings;
     const userAgentId = settings.activeUserAgentId;
 
-    // NEW: Detect if this is a VOD file
-    const isVOD = isVODFile(channel.url);
-    console.log(`[MultiView] URL type for ${widgetId}: ${isVOD ? 'VOD file' : 'Live stream'}`);
-
-    let profileIdToUse;
-    let streamUrlToPlay;
-    let useNativeVideo = false;
-
-    if (isVOD) {
-        // For VOD files, auto-select fMP4 profile (same as Direct Player)
-        const hasNVIDIA = settings.hasNvidiaGpu;
-        profileIdToUse = hasNVIDIA ? 'ffmpeg-fmp4-nvidia' : 'ffmpeg-fmp4';
-        console.log(`[MultiView] Auto-selected ${hasNVIDIA ? 'NVIDIA' : 'CPU'} fMP4 profile for VOD`);
-
-        streamUrlToPlay = `/stream?url=${encodeURIComponent(channel.url)}&profileId=${profileIdToUse}&userAgentId=${userAgentId}`;
-        useNativeVideo = true;
-    } else {
-        // For live streams, use existing logic
-        profileIdToUse = settings.activeStreamProfileId;
-        const profile = (settings.streamProfiles || []).find(p => p.id === profileIdToUse);
-
-        if (!profile) {
-            showNotification("Active stream profile not found in settings.", true);
-            return;
-        }
-
-        streamUrlToPlay = profile.command === 'redirect'
-            ? channel.url
-            : `/stream?url=${encodeURIComponent(channel.url)}&profileId=${profileIdToUse}&userAgentId=${userAgentId}`;
-
-        if (profile.command === 'redirect') {
-            const historyId = await startRedirectStream(channel.url, channel.id, channel.name, channel.logo);
-            if (historyId) {
-                redirectHistoryIds.set(widgetId, historyId);
-                startMultiviewHeartbeats();
-            }
-        }
-    }
+    const profileIdToUse = settings.activeStreamProfileId;
+    const streamUrlToPlay = `/stream?url=${encodeURIComponent(channel.url)}&profileId=${profileIdToUse}&userAgentId=${userAgentId}`;
 
     console.log(`[MultiView] Final stream URL for widget ${widgetId}: ${streamUrlToPlay}`);
 
-    // NEW: Use native video for VOD, mpegts.js for live
-    if (useNativeVideo) {
-        console.log(`[MultiView] Using native HTML5 video for VOD file`);
-
-        videoEl.src = streamUrlToPlay;
-
-        videoEl.addEventListener('loadedmetadata', () => {
-            console.log(`[MultiView] VOD metadata loaded for ${widgetId}`);
-        }, { once: true });
-
-        videoEl.addEventListener('error', (e) => {
-            console.error(`[MultiView] Native video error for ${widgetId}:`, e);
-            if (!document.hidden) {
-                showNotification(`Could not play file: ${channel.name}`, true);
-            }
-            stopAndCleanupPlayer(widgetId, true);
-        }, { once: true });
-
-        try {
-            await videoEl.play();
-            setActivePlayer(widgetId);
-            console.log(`[MultiView] VOD playback started for ${widgetId}`);
-        } catch (err) {
-            if (err.name !== 'AbortError') {
-                console.error(`[MultiView] VOD playback error for ${widgetId}:`, err);
-                if (!document.hidden) {
-                    showNotification(`Could not play file: ${channel.name}`, true);
-                }
-                stopAndCleanupPlayer(widgetId, true);
-            }
-        }
-    } else {
+    {
         // Existing mpegts.js logic for live streams
         if (mpegts.isSupported()) {
             const mpegtsConfig = {
@@ -822,12 +637,6 @@ async function playChannelInWidget(widgetId, channel, gridstackItemContentEl) {
  */
 async function stopAndCleanupPlayer(widgetId, resetUI = true) {
     const stopPromises = [];
-
-    if (redirectHistoryIds.has(widgetId)) {
-        stopPromises.push(stopRedirectStream(redirectHistoryIds.get(widgetId)));
-        redirectHistoryIds.delete(widgetId);
-        checkAndStopMultiviewHeartbeats();
-    }
 
     if (playerUrls.has(widgetId)) {
         const originalUrl = playerUrls.get(widgetId);
@@ -881,14 +690,13 @@ async function stopAndCleanupPlayer(widgetId, resetUI = true) {
     }
 }
 
-
 /**
  * Populates the channel selector modal.
  */
 export function populateChannelSelector() {
     // NEW: Reset to "From List" tab when opening modal
     if (UIElements.multiviewSourceListBtn) {
-        UIElements.multiviewSourceListBtn.click();
+
     }
 
     const listEl = UIElements.channelSelectorList;
@@ -921,9 +729,9 @@ export function populateChannelSelector() {
     }
 
     listEl.innerHTML = channelsToDisplay.map(channel => `
-        <div class="channel-item flex items-center p-2 rounded-md hover:bg-gray-700 cursor-pointer" 
-             data-id="${channel.id}" 
-             data-name="${channel.displayName || channel.name}" 
+        <div class="channel-item flex items-center p-2 rounded-md hover:bg-gray-700 cursor-pointer"
+             data-id="${channel.id}"
+             data-name="${channel.displayName || channel.name}"
              data-url="${channel.url}"
              data-logo="${channel.logo}">
             <img src="${channel.logo}" onerror="this.onerror=null; this.src='https://placehold.co/40x40/1f2937/d1d5db?text=?';" class="w-10 h-10 object-contain mr-3 rounded-md bg-gray-700 flex-shrink-0">
@@ -935,20 +743,12 @@ export function populateChannelSelector() {
     `).join('');
 }
 
-
 // --- Layout Management ---
 
 /**
  * Fetches saved layouts from the server.
  */
 async function loadLayouts() {
-    const res = await apiFetch('/api/multiview/layouts');
-    if (!res || !res.ok) {
-        showNotification('Could not load saved layouts.', true);
-        return;
-    }
-    const layouts = await res.json();
-    guideState.settings.multiviewLayouts = layouts;
     populateLayoutsDropdown();
 }
 
@@ -997,21 +797,13 @@ async function saveLayout(e) {
         };
     });
 
-
-    const res = await apiFetch('/api/multiview/layouts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, layout_data: layoutData }),
-    });
-
-    if (res && res.ok) {
-        showNotification('Layout saved successfully!');
+    const layouts = [...(guideState.settings.multiviewLayouts || []), { id: crypto.randomUUID(), name, layout_data: layoutData }];
+    if (await savePreference('multiviewLayouts', layouts)) {
         closeModal(UIElements.saveLayoutModal);
         UIElements.saveLayoutForm.reset();
         loadLayouts();
     }
 }
-
 
 /**
  * Loads a selected layout from the dropdown.
@@ -1044,7 +836,6 @@ function loadSelectedLayout() {
     );
 }
 
-
 /**
  * Deletes the currently selected layout.
  */
@@ -1056,10 +847,7 @@ async function deleteLayout() {
     }
 
     showConfirm('Delete Layout?', 'Are you sure you want to delete this saved layout?', async () => {
-        const res = await apiFetch(`/api/multiview/layouts/${layoutId}`, { method: 'DELETE' });
-        if (res && res.ok) {
-            showNotification('Layout deleted successfully.');
-            loadLayouts();
-        }
+        const layouts = (guideState.settings.multiviewLayouts || []).filter(item => String(item.id) !== layoutId);
+        if (await savePreference('multiviewLayouts', layouts)) loadLayouts();
     });
 }

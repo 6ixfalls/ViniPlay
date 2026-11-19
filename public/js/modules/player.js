@@ -5,29 +5,25 @@
 
 import { appState, guideState, UIElements } from './state.js';
 // MODIFIED: Added stopStream and sendRedirectHeartbeat to the import
-import { saveUserSetting, stopStream, startRedirectStream, stopRedirectStream, sendRedirectHeartbeat, saveWatchProgressApi, getWatchProgress, deleteWatchProgress } from './api.js';
+import { savePreference, stopStream } from "./api.js";
 import { showNotification, openModal, closeModal } from './ui.js';
 import { castState, loadMedia, setLocalPlayerState } from './cast.js';
-import { logToPlayerConsole } from './player_direct.js';
+
 import { ICONS } from './icons.js'; // NEW: Import ICONS
 import { getCodecName } from './codecs.js'; // NEW: Import codec utility
-import { sendTelemetry, tracePlayerAction } from './telemetry.js';
 
 let streamInfoInterval = null; // Interval to update stream stats
 let currentLocalStreamUrl = null; // ADDED: Track the original URL of the currently playing local stream
 let currentProfileId = null; // ADDED: Track the profile ID of the current stream
-let currentRedirectHistoryId = null; // To track redirect streams for logging
-let redirectHeartbeatInterval = null; // NEW: Periodic heartbeat timer for active redirect stream
-let currentRedirectToken = 0; // NEW: Guard against race conditions when switching streams
+
+ // NEW: Guard against race conditions when switching streams
 let currentStreamUrlToPlay = null; // Track full stream URL for audio/video swapping
 let isUserInitiatedPause = false; // Distinguishes intentional user pause from OS screen lock
 let isTransitioningFromPip = false; // Prevents OS PiP docking pause from being misclassified as user pause
 let playbackLockRelease = null; // Web Lock to prevent Chrome Android from discarding background tab
 
 // --- NEW: Watch Progress Tracking State ---
-let currentActiveMedia = null; // Stores { contentType, contentId, title, duration }
-let progressSaveInterval = null;
-let lastSavedProgressSec = -1;
+ // Stores { contentType, contentId, title, duration }
 
 // --- NEW: Auto-retry logic state ---
 let currentChannelInfo = null; // Stores { url, name, channelId, logo } for retries
@@ -61,168 +57,23 @@ export function releaseTabDiscardLock() {
 }
 
 /**
- * Starts periodic 30s heartbeat pings for an active redirect stream.
- * @param {number} historyId
- */
-function startRedirectHeartbeat(historyId) {
-    stopRedirectHeartbeat();
-    if (!historyId) return;
-    redirectHeartbeatInterval = setInterval(async () => {
-        if (currentRedirectHistoryId === historyId) {
-            const ok = await sendRedirectHeartbeat(historyId);
-            if (!ok) {
-                console.warn(`[PLAYER] Heartbeat failed or stream was closed by server for history ID ${historyId}.`);
-            }
-        } else {
-            stopRedirectHeartbeat();
-        }
-    }, 30000);
-}
-
-/**
- * Stops the redirect stream heartbeat interval.
- */
-function stopRedirectHeartbeat() {
-    if (redirectHeartbeatInterval) {
-        clearInterval(redirectHeartbeatInterval);
-        redirectHeartbeatInterval = null;
-    }
-}
-
-/**
- * Starts a redirect logging session and initiates periodic heartbeats.
- * Guards against race conditions if user switches streams before promise resolves.
- */
-function beginRedirectLogging(url, channelOrVodId, name, logo) {
-    if (currentRedirectHistoryId) {
-        stopRedirectStream(currentRedirectHistoryId);
-        currentRedirectHistoryId = null;
-    }
-    stopRedirectHeartbeat();
-
-    const token = ++currentRedirectToken;
-
-    startRedirectStream(url, channelOrVodId, name, logo)
-        .then(historyId => {
-            if (!historyId) return;
-            // If the user already switched channels or closed player, immediately stop this session
-            if (token !== currentRedirectToken) {
-                console.log(`[PLAYER] Redirect stream ${historyId} was superseded. Stopping orphaned session.`);
-                stopRedirectStream(historyId);
-                return;
-            }
-            currentRedirectHistoryId = historyId;
-            startRedirectHeartbeat(historyId);
-        })
-        .catch(err => console.error('[PLAYER] Error starting redirect stream logging:', err));
-}
-
-/**
  * Calculates current playback progress and duration for active media.
  * @returns {{ contentType: string, contentId: string, progressSeconds: number, durationSeconds: number } | null}
  */
-export function getCurrentPlaybackProgress() {
-    if (!currentActiveMedia) return null;
-    let progress = 0;
-    let duration = 0;
-
-    if (currentVodTranscodeSession) {
-        const curElapsed = UIElements.videoElement?.currentTime || 0;
-        progress = (currentVodTranscodeSession.currentSeekTime || 0) + curElapsed;
-        duration = currentVodTranscodeSession.duration || currentActiveMedia.duration || 0;
-    } else if (UIElements.videoElement) {
-        progress = UIElements.videoElement.currentTime || 0;
-        const vidDur = UIElements.videoElement.duration;
-        duration = (isFinite(vidDur) && vidDur > 0) ? vidDur : (currentActiveMedia.duration || 0);
-    }
-
-    return {
-        contentType: currentActiveMedia.contentType,
-        contentId: currentActiveMedia.contentId,
-        progressSeconds: Math.floor(progress),
-        durationSeconds: Math.floor(duration)
-    };
-}
 
 /**
  * Sets active media for tracking watch progress and starts periodic saving.
  * @param {{ contentType: string, contentId: string|number, title?: string, duration?: number } | null} mediaInfo
  */
-export function setActiveMediaTracking(mediaInfo) {
-    flushWatchProgress();
-
-    if (!mediaInfo || !mediaInfo.contentType || !mediaInfo.contentId) {
-        currentActiveMedia = null;
-        if (progressSaveInterval) {
-            clearInterval(progressSaveInterval);
-            progressSaveInterval = null;
-        }
-        return;
-    }
-
-    currentActiveMedia = {
-        contentType: mediaInfo.contentType,
-        contentId: String(mediaInfo.contentId),
-        title: mediaInfo.title || '',
-        duration: mediaInfo.duration || 0
-    };
-    lastSavedProgressSec = -1;
-
-    if (progressSaveInterval) clearInterval(progressSaveInterval);
-    // Auto-save every 10 seconds during active playback
-    progressSaveInterval = setInterval(() => {
-        saveCurrentWatchProgress(false);
-    }, 10000);
-    console.log(`[PLAYER] Active media tracking started for ${currentActiveMedia.contentType}:${currentActiveMedia.contentId}`);
-}
 
 /**
  * Saves current watch progress to the backend if threshold met.
  * @param {boolean} [force=false]
  */
-export function saveCurrentWatchProgress(force = false) {
-    if (!currentActiveMedia) return;
-    const prog = getCurrentPlaybackProgress();
-    if (!prog) return;
-
-    if (!force && Math.abs(prog.progressSeconds - lastSavedProgressSec) < 3) {
-        return;
-    }
-    if (prog.progressSeconds < 5 && !force) {
-        return;
-    }
-
-    lastSavedProgressSec = prog.progressSeconds;
-    saveWatchProgressApi(prog.contentType, prog.contentId, prog.progressSeconds, prog.durationSeconds);
-}
 
 /**
  * Immediately flushes watch progress to the server (e.g. on unload/cleanup).
  */
-export function flushWatchProgress() {
-    if (!currentActiveMedia) return;
-    const prog = getCurrentPlaybackProgress();
-    if (prog && prog.progressSeconds >= 5) {
-        const payload = JSON.stringify({
-            contentType: prog.contentType,
-            contentId: prog.contentId,
-            progressSeconds: prog.progressSeconds,
-            durationSeconds: prog.durationSeconds
-        });
-        if (navigator.sendBeacon) {
-            const blob = new Blob([payload], { type: 'application/json' });
-            navigator.sendBeacon('/api/progress', blob);
-        } else {
-            saveWatchProgressApi(prog.contentType, prog.contentId, prog.progressSeconds, prog.durationSeconds);
-        }
-    }
-    currentActiveMedia = null;
-    if (progressSaveInterval) {
-        clearInterval(progressSaveInterval);
-        progressSaveInterval = null;
-    }
-    lastSavedProgressSec = -1;
-}
 
 // --- NEW: Screen Wake Lock & Mobile State ---
 let screenWakeLock = null;
@@ -288,10 +139,6 @@ function startAudioKeepAwake() {
     }
 }
 
-/**
- * Prime wake lock and audio session synchronously on ANY first user touch or click.
- * This unlocks the browser's media autoplay policy with user activation authority.
- */
 export function primeMobileKeepAwake() {
     if (userGesturePrimed) return;
     userGesturePrimed = true;
@@ -479,9 +326,7 @@ export function togglePlayerLock(forceState = null) {
     } else {
         videoModal?.classList.remove('player-locked');
         lockOverlay?.classList.add('hidden');
-        if (videoEl && !isAudioOnly && !currentVodTranscodeSession && !appState.activeTimeshiftJobId) {
-            videoEl.controls = true;
-        }
+
         if (lockBtn) {
             lockBtn.classList.remove('text-yellow-400');
             lockBtn.classList.add('text-gray-400');
@@ -632,7 +477,6 @@ function handleStreamError() {
     }, 2000); // 2-second delay before retrying
 }
 
-
 /**
  * NEW: Forcefully stops and restarts the current stream.
  * This function will be triggered by the new refresh button.
@@ -664,31 +508,13 @@ export async function forceRefreshStream() {
     playChannel(currentChannelInfo.url, currentChannelInfo.name, currentChannelInfo.channelId);
 }
 
-
 /**
  * Stops the current local stream, cleans up the mpegts.js player instance, and closes the modal.
  * This does NOT affect an active Google Cast session.
  */
 export const stopAndCleanupPlayer = async () => { // MODIFIED: Made function async
-    tracePlayerAction('stopAndCleanupPlayer() invoked', {
-        currentLocalStreamUrl,
-        currentRedirectHistoryId,
-        isUserInitiatedPause,
-        visibilityState: document.visibilityState
-    });
 
     // Flush watch progress before tearing down players
-    flushWatchProgress();
-
-    // NEW: Stop redirect heartbeat and invalidate in-flight promises
-    stopRedirectHeartbeat();
-    currentRedirectToken++;
-
-    // If we were logging a redirect stream, tell the server it has stopped.
-    if (currentRedirectHistoryId) {
-        stopRedirectStream(currentRedirectHistoryId);
-        currentRedirectHistoryId = null;
-    }
 
     // NEW: Clear any scheduled retry attempt
     if (retryTimeout) {
@@ -697,7 +523,6 @@ export const stopAndCleanupPlayer = async () => { // MODIFIED: Made function asy
     }
     retryCount = 0;
     currentChannelInfo = null;
-
 
     // Explicitly tell the server to stop the stream process.
     if (currentLocalStreamUrl && !castState.isCasting) {
@@ -725,59 +550,6 @@ export const stopAndCleanupPlayer = async () => { // MODIFIED: Made function asy
         appState.player = null;
     }
 
-    // Destroy Hls.js player if active (e.g. timeshift playback)
-    if (appState.hlsPlayer) {
-        console.log('[PLAYER] Destroying Hls.js instance.');
-        try {
-            appState.hlsPlayer.destroy();
-        } catch (e) {
-            console.warn('[PLAYER] Error destroying Hls.js player:', e);
-        }
-        appState.hlsPlayer = null;
-    }
-    if (appState.shakaPlayer) {
-        try {
-            await appState.shakaPlayer.destroy();
-        } catch (e) { }
-        appState.shakaPlayer = null;
-    }
-
-    // Hide timeshift controls overlay if visible
-    const timeshiftOverlay = document.getElementById('timeshift-controls-overlay') || UIElements.timeshiftControlsOverlay;
-    if (timeshiftOverlay) {
-        timeshiftOverlay.classList.add('hidden');
-    }
-
-    // Hide VOD controls overlay if visible
-    const vodOverlay = document.getElementById('vod-controls-overlay');
-    if (vodOverlay) {
-        vodOverlay.classList.add('hidden');
-        vodOverlay.style.opacity = '0';
-    }
-    if (vodTimeUpdateInterval) {
-        clearInterval(vodTimeUpdateInterval);
-        vodTimeUpdateInterval = null;
-    }
-    if (vodHideControlsTimeout) {
-        clearTimeout(vodHideControlsTimeout);
-        vodHideControlsTimeout = null;
-    }
-    if (seekDebounceTimeout) {
-        clearTimeout(seekDebounceTimeout);
-        seekDebounceTimeout = null;
-    }
-    pendingSeekTarget = null;
-    isVodSeeking = false;
-
-    // Stop active timeshift session on server if running
-    if (appState.activeTimeshiftJobId) {
-        console.log(`[PLAYER] Sending stop beacon for timeshift job ${appState.activeTimeshiftJobId}`);
-        try {
-            navigator.sendBeacon(`/api/dvr/timeshift/${appState.activeTimeshiftJobId}/stop`);
-        } catch (e) { }
-        appState.activeTimeshiftJobId = null;
-    }
-
     isUserInitiatedPause = true;
     releaseTabDiscardLock();
 
@@ -789,7 +561,6 @@ export const stopAndCleanupPlayer = async () => { // MODIFIED: Made function asy
     }
 
     currentStreamUrlToPlay = null;
-    currentVodTranscodeSession = null;
 
     setLocalPlayerState(null, null, null);
 
@@ -867,7 +638,6 @@ function updateStreamInfo() {
     UIElements.streamInfoAudio.textContent = `A Codec: ${getCodecName(audioCodec)}`;
 }
 
-
 /**
  * Initializes and starts playing a channel stream, either locally or on a Cast device.
  * @param {string} url - The URL of the channel stream.
@@ -893,16 +663,12 @@ export const playChannel = (url, name, channelId) => {
 
     // Store current channel info for potential retries and overlays
     currentChannelInfo = { url, name, channelId, logo };
-    sendTelemetry('PLAYER_PLAY_CHANNEL', `playChannel initiated for "${name}" (${channelId})`, {
-        url,
-        profileId: guideState.settings.activeStreamProfileId
-    });
 
     // Update and save recent channels regardless of playback target
     if (channelId) {
         const recentChannels = [channelId, ...(guideState.settings.recentChannels || []).filter(id => id !== channelId)].slice(0, 15);
         guideState.settings.recentChannels = recentChannels;
-        saveUserSetting('recentChannels', recentChannels);
+        savePreference('recentChannels', recentChannels);
     }
 
     const profileId = guideState.settings.activeStreamProfileId;
@@ -916,14 +682,9 @@ export const playChannel = (url, name, channelId) => {
         return showNotification("Stream profile not found.", true);
     }
 
-    // --- Activity Logging for Redirect Streams ---
-    if (profile.command === 'redirect') {
-        const channel = guideState.channels.find(c => c.id === channelId);
-        beginRedirectLogging(url, channelId, name, channel ? channel.logo : '');
-    }
     // --- End Activity Logging ---
 
-    const streamUrlToPlay = profile.command === 'redirect' ? url : `/stream?url=${encodeURIComponent(url)}&profileId=${profileId}&userAgentId=${userAgentId}`;
+    const streamUrlToPlay = `/stream?url=${encodeURIComponent(url)}&profileId=${profileId}&userAgentId=${userAgentId}`;
     currentStreamUrlToPlay = streamUrlToPlay;
     if (isAudioOnly) {
         toggleAudioOnly(false);
@@ -1032,7 +793,6 @@ export const playChannel = (url, name, channelId) => {
     }
 };
 
-
 /**
  * Plays a local video or recording file using the unified video modal and native HTML5 video player.
  * Supports Picture-in-Picture, Audio-Only mode, Touch Lock, Aspect-Ratio locking, and Container Fullscreen.
@@ -1043,477 +803,6 @@ export const playChannel = (url, name, channelId) => {
  * @param {number} [startTime=0] - Starting timestamp offset in seconds for resuming playback.
  * @param {object|null} [mediaInfo=null] - Media tracking metadata { contentType, contentId, title, duration }.
  */
-export const playRecordingOrDirectVideo = async (url, title, logo = '', isVod = false, startTime = 0, mediaInfo = null) => {
-    console.log(`[PLAYER] Playing direct/recording video: "${title}" from ${url} (isVod: ${isVod}, startTime: ${startTime})`);
-
-    // 1. Cleanly stop any existing active stream
-    await stopAndCleanupPlayer();
-    isUserInitiatedPause = false;
-    currentStreamUrlToPlay = url;
-    if (isAudioOnly) {
-        toggleAudioOnly(false);
-    }
-
-    // 2. Setup title, channel info, and media session
-    if (UIElements.videoTitle) {
-        UIElements.videoTitle.textContent = title;
-    }
-    currentChannelInfo = { url, name: title, channelId: null, logo };
-    updateMediaSession(title, logo || '/viniplay.png');
-
-    // 3. Hide live-only buttons (like refresh-stream-btn)
-    const refreshBtn = document.getElementById('refresh-stream-btn');
-    if (refreshBtn) refreshBtn.classList.add('hidden');
-
-    // 4. Activity logging for Direct VOD sessions
-    if (isVod) {
-        const vodItem = (guideState.vodMovies || []).find(m => m.url === url) || (guideState.vodSeries || []).find(s => s.url === url);
-        const vodId = vodItem ? vodItem.id : null;
-        beginRedirectLogging(url, vodId, title, logo);
-    }
-
-    // 5. Watch Progress Tracking
-    if (mediaInfo) {
-        setActiveMediaTracking(mediaInfo);
-    } else if (isVod) {
-        const vodItem = (guideState.vodMovies || []).find(m => m.url === url) || (guideState.vodSeries || []).find(s => s.url === url);
-        if (vodItem) {
-            setActiveMediaTracking({
-                contentType: vodItem.type === 'series' ? 'vod_episode' : 'vod_movie',
-                contentId: vodItem.id,
-                title: title,
-                duration: vodItem.duration || 0
-            });
-        }
-    }
-
-    // 6. Configure video element
-    if (UIElements.videoElement) {
-        UIElements.videoElement.src = url;
-        UIElements.videoElement.load();
-        UIElements.videoElement.volume = parseFloat(localStorage.getItem('iptvPlayerVolume') || 0.5);
-
-        if (startTime > 0) {
-            const applyStartTime = () => {
-                try {
-                    if (UIElements.videoElement) {
-                        UIElements.videoElement.currentTime = startTime;
-                        console.log(`[PLAYER] Direct video seeked to start time: ${startTime}s`);
-                    }
-                } catch (e) {
-                    console.warn('[PLAYER] Error seeking direct video to startTime:', e);
-                }
-            };
-            if (UIElements.videoElement.readyState >= 1) {
-                applyStartTime();
-            } else {
-                UIElements.videoElement.addEventListener('loadedmetadata', applyStartTime, { once: true });
-            }
-        }
-    }
-
-    // 7. Open unified video modal
-    UIElements.videoModal?.classList.remove('pip-active');
-    openModal(UIElements.videoModal);
-    requestScreenWakeLock();
-
-    try {
-        await UIElements.videoElement.play();
-        console.log(`[PLAYER] Direct playback started successfully for: "${title}"`);
-    } catch (err) {
-        console.warn("[PLAYER] Autoplay prevented or playback error:", err);
-    }
-};
-
-// State tracking for transcoded VOD seeking via -ss on /stream
-let currentVodTranscodeSession = null;
-let vodTimeUpdateInterval = null;
-let vodHideControlsTimeout = null;
-let isVodSeeking = false;
-let pendingSeekTarget = null;
-let seekDebounceTimeout = null;
-
-function formatTimeSeconds(seconds) {
-    const s = Math.max(0, Math.floor(seconds));
-    const hrs = Math.floor(s / 3600);
-    const mins = Math.floor((s % 3600) / 60);
-    const secs = s % 60;
-    if (hrs > 0) {
-        return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-    }
-    return `${mins}:${secs.toString().padStart(2, '0')}`;
-}
-
-export function seekVodRelative(delta) {
-    if (!currentVodTranscodeSession) return;
-    const curElapsed = UIElements.videoElement?.currentTime || 0;
-    const baseTime = pendingSeekTarget !== null 
-        ? pendingSeekTarget 
-        : (currentVodTranscodeSession.currentSeekTime + curElapsed);
-    
-    const maxTime = currentVodTranscodeSession.duration || 86400;
-    pendingSeekTarget = Math.max(0, Math.min(maxTime, baseTime + delta));
-    
-    const currentTimeEl = document.getElementById('vod-current-time');
-    const progressBar = document.getElementById('vod-progress-bar');
-    if (currentTimeEl) currentTimeEl.textContent = formatTimeSeconds(pendingSeekTarget);
-    if (progressBar) progressBar.value = pendingSeekTarget;
-
-    showNotification(`Seeking to ${formatTimeSeconds(pendingSeekTarget)}...`, false, 1200);
-
-    if (seekDebounceTimeout) clearTimeout(seekDebounceTimeout);
-    seekDebounceTimeout = setTimeout(() => {
-        const target = pendingSeekTarget;
-        pendingSeekTarget = null;
-        performVodSeek(target);
-    }, 350);
-}
-
-export function performVodSeek(targetTime) {
-    if (!currentVodTranscodeSession) return;
-    const session = currentVodTranscodeSession;
-    const safeTarget = Math.max(0, Math.floor(targetTime));
-    playVOD(session.url, session.title, session.logo, safeTarget, session.duration);
-}
-
-function updateVodControlsUI() {
-    const video = UIElements.videoElement;
-    if (!video || !currentVodTranscodeSession) return;
-
-    if (isVodSeeking || pendingSeekTarget !== null) return;
-
-    const curElapsed = video.currentTime || 0;
-    const curTotalTime = currentVodTranscodeSession.currentSeekTime + curElapsed;
-
-    const currentTimeEl = document.getElementById('vod-current-time');
-    const totalTimeEl = document.getElementById('vod-total-time');
-    const progressBar = document.getElementById('vod-progress-bar');
-    const playPauseBtn = document.getElementById('vod-play-pause-btn');
-
-    if (currentTimeEl) currentTimeEl.textContent = formatTimeSeconds(curTotalTime);
-    
-    const duration = currentVodTranscodeSession.duration;
-    if (duration && duration > 0) {
-        if (progressBar) {
-            progressBar.max = duration;
-            progressBar.value = Math.min(duration, curTotalTime);
-        }
-        if (totalTimeEl) totalTimeEl.textContent = formatTimeSeconds(duration);
-    } else {
-        if (progressBar) {
-            progressBar.max = Math.max(curTotalTime + 60, parseFloat(progressBar.max) || 100);
-            progressBar.value = curTotalTime;
-        }
-        if (totalTimeEl) totalTimeEl.textContent = '--:--';
-    }
-
-    if (playPauseBtn) {
-        playPauseBtn.innerHTML = video.paused ? ICONS.play : ICONS.pause;
-    }
-}
-
-function setupVodControlsOverlay(profileName) {
-    const overlay = document.getElementById('vod-controls-overlay');
-    if (!overlay) return;
-
-    overlay.classList.remove('hidden');
-    overlay.style.opacity = '1';
-
-    const progressBar = document.getElementById('vod-progress-bar');
-    const currentTimeEl = document.getElementById('vod-current-time');
-    const totalTimeEl = document.getElementById('vod-total-time');
-    const playPauseBtn = document.getElementById('vod-play-pause-btn');
-    const rewind60Btn = document.getElementById('vod-rewind-60-btn');
-    const rewind15Btn = document.getElementById('vod-rewind-15-btn');
-    const forward15Btn = document.getElementById('vod-forward-15-btn');
-    const forward60Btn = document.getElementById('vod-forward-60-btn');
-    const volumeBtn = document.getElementById('vod-volume-btn');
-    const volumeBar = document.getElementById('vod-volume-bar');
-    const fullscreenBtn = document.getElementById('vod-fullscreen-btn');
-    const profileBadge = document.getElementById('vod-profile-badge');
-
-    if (profileBadge) profileBadge.textContent = profileName || 'Transcoding';
-
-    const initialSeek = currentVodTranscodeSession?.currentSeekTime || 0;
-    const initialDur = currentVodTranscodeSession?.duration || 0;
-
-    if (currentTimeEl) currentTimeEl.textContent = formatTimeSeconds(initialSeek);
-    if (totalTimeEl) totalTimeEl.textContent = initialDur > 0 ? formatTimeSeconds(initialDur) : '--:--';
-    if (progressBar) {
-        progressBar.min = 0;
-        progressBar.max = initialDur > 0 ? initialDur : Math.max(100, initialSeek + 60);
-        progressBar.value = initialSeek;
-    }
-
-    if (playPauseBtn) {
-        playPauseBtn.innerHTML = ICONS.pause;
-        playPauseBtn.onclick = () => {
-            if (UIElements.videoElement) {
-                if (UIElements.videoElement.paused) UIElements.videoElement.play();
-                else UIElements.videoElement.pause();
-                playPauseBtn.innerHTML = UIElements.videoElement.paused ? ICONS.play : ICONS.pause;
-            }
-        };
-    }
-
-    if (rewind60Btn) rewind60Btn.onclick = () => seekVodRelative(-60);
-    if (rewind15Btn) rewind15Btn.onclick = () => seekVodRelative(-15);
-    if (forward15Btn) forward15Btn.onclick = () => seekVodRelative(15);
-    if (forward60Btn) forward60Btn.onclick = () => seekVodRelative(60);
-
-    if (progressBar) {
-        progressBar.oninput = (e) => {
-            isVodSeeking = true;
-            if (currentTimeEl) currentTimeEl.textContent = formatTimeSeconds(parseFloat(e.target.value));
-        };
-        progressBar.onchange = (e) => {
-            isVodSeeking = false;
-            const targetSec = parseFloat(e.target.value);
-            performVodSeek(targetSec);
-        };
-    }
-
-    if (volumeBar && UIElements.videoElement) {
-        volumeBar.value = UIElements.videoElement.volume;
-        volumeBar.oninput = (e) => {
-            const val = parseFloat(e.target.value);
-            UIElements.videoElement.volume = val;
-            UIElements.videoElement.muted = val === 0;
-            localStorage.setItem('iptvPlayerVolume', val);
-        };
-    }
-
-    if (volumeBtn && UIElements.videoElement) {
-        volumeBtn.onclick = () => {
-            UIElements.videoElement.muted = !UIElements.videoElement.muted;
-            if (volumeBar) {
-                volumeBar.value = UIElements.videoElement.muted ? 0 : UIElements.videoElement.volume;
-            }
-        };
-    }
-
-    if (fullscreenBtn) {
-        fullscreenBtn.onclick = () => {
-            const fsBtn = document.getElementById('player-fullscreen-btn');
-            if (fsBtn) fsBtn.click();
-        };
-    }
-
-    // Auto-hide controls overlay during active playback
-    const container = UIElements.videoModalContainer || document.getElementById('video-modal-container');
-    const showControls = () => {
-        if (overlay) overlay.style.opacity = '1';
-        if (vodHideControlsTimeout) clearTimeout(vodHideControlsTimeout);
-        vodHideControlsTimeout = setTimeout(() => {
-            const video = UIElements.videoElement;
-            if (video && !video.paused && !isVodSeeking && pendingSeekTarget === null) {
-                if (overlay) overlay.style.opacity = '0';
-            }
-        }, 3500);
-    };
-
-    if (container) {
-        container.onmousemove = showControls;
-        container.ontouchstart = showControls;
-    }
-    showControls();
-
-    // Start interval
-    if (vodTimeUpdateInterval) clearInterval(vodTimeUpdateInterval);
-    vodTimeUpdateInterval = setInterval(updateVodControlsUI, 500);
-}
-
-/**
- * Plays a VOD (Movie or Episode) using either the native <video> element (Direct Play)
- * or the server's /stream endpoint with fast input seeking (-ss).
- * @param {string} url - The direct URL to the VOD file (e.g., .mp4, .mkv).
- * @param {string} title - The title of the VOD to display.
- * @param {string} [logo] - Channel / poster logo URL.
- * @param {number} [startTime=0] - Starting timestamp offset in seconds for seeking.
- * @param {number|null} [knownDuration=null] - Preserved total duration in seconds.
- * @param {object|null} [mediaInfo=null] - Media tracking metadata { contentType, contentId, title, duration }.
- */
-export const playVOD = async (url, title, logo = '', startTime = 0, knownDuration = null, mediaInfo = null) => {
-    const useDirectPlay = guideState.settings.vodDirectPlayEnabled === true;
-    console.log(`[VOD_PLAYER] Attempting to play VOD: "${title}" | Direct Play: ${useDirectPlay} | StartTime: ${startTime}`);
-
-    const preservedDuration = knownDuration !== null ? knownDuration : (currentVodTranscodeSession?.url === url ? currentVodTranscodeSession?.duration : (mediaInfo?.duration || null));
-
-    // 1. Stop any existing player (live or VOD), regardless of play method chosen
-    await stopAndCleanupPlayer();
-    await new Promise(r => setTimeout(r, 50)); // Short micro-yield to allow browser MSE decoder to flush
-
-    // 2. Get necessary settings
-    const settings = guideState.settings;
-    const profileId = settings.activeStreamProfileId;
-    const userAgentId = settings.activeUserAgentId;
-    const profile = (settings.streamProfiles || []).find(p => p.id === profileId);
-
-    // Hide VOD controls overlay if not transcoding
-    const vodOverlay = document.getElementById('vod-controls-overlay');
-
-    // --- DIRECT PLAY / REDIRECT LOGIC ---
-    // If Direct Play is explicitly enabled OR the active profile is 'redirect' (no transcoding),
-    // always use native HTML5 <video> playback. Never pass direct MKV/MP4 files into mpegts.js.
-    if (useDirectPlay || !profile || profile.command === 'redirect') {
-        currentVodTranscodeSession = null;
-        if (vodOverlay) {
-            vodOverlay.classList.add('hidden');
-            vodOverlay.style.opacity = '0';
-        }
-        await playRecordingOrDirectVideo(url, title, logo, true, startTime, mediaInfo);
-        return;
-    }
-
-    // --- PROFILE / TRANSCODED PLAY Logic via /stream endpoint ---
-    console.log(`[VOD_PLAYER] Using FFmpeg transcode profile: ${profile.name} (ID=${profileId}) via /stream endpoint.`);
-    logToPlayerConsole(`Attempting VOD playback via Profile: ${title} (${profile.name})`);
-
-    // Store session info so user can seek/skip in transcoded mode
-    currentVodTranscodeSession = {
-        url,
-        title,
-        logo,
-        profileId,
-        userAgentId,
-        currentSeekTime: startTime || 0,
-        duration: preservedDuration
-    };
-
-    let streamUrlToPlay = `/stream?url=${encodeURIComponent(url)}&profileId=${profileId}&userAgentId=${userAgentId}&vodName=${encodeURIComponent(title)}&vodLogo=${encodeURIComponent(logo)}`;
-    if (startTime > 0) {
-        streamUrlToPlay += `&startTime=${Math.floor(startTime)}`;
-    }
-
-    isUserInitiatedPause = false;
-    currentStreamUrlToPlay = streamUrlToPlay;
-    currentLocalStreamUrl = url;
-    currentProfileId = profileId;
-
-    if (isAudioOnly) {
-        toggleAudioOnly(false);
-    }
-
-    console.log(`[VOD_PLAYER] Final stream URL: ${streamUrlToPlay}`);
-    logToPlayerConsole(`Final stream URL: ${streamUrlToPlay}`);
-
-    // If profile outputs MP4 container (fMP4), play directly via native video element
-    if (profile.command && profile.command.includes('-f mp4')) {
-        console.log(`[VOD_PLAYER] Profile uses fMP4. Playing via native video element: ${streamUrlToPlay}`);
-        await playRecordingOrDirectVideo(streamUrlToPlay, title, logo, false, 0, mediaInfo);
-        return;
-    }
-
-    // Profile outputs MPEG-TS: use mpegts.js
-    if (mpegts.isSupported()) {
-        const mpegtsConfig = {
-            enableStashBuffer: true,
-            stashInitialSize: 4096,
-            liveSync: false, // For VOD, do not drop frames to chase live edge!
-            lazyLoad: false,
-        };
-        logToPlayerConsole(`mpegts.js config: enableStashBuffer=${mpegtsConfig.enableStashBuffer}, stashInitialSize=${mpegtsConfig.stashInitialSize}KB`);
-
-        try {
-            appState.player = mpegts.createPlayer({
-                type: 'mse',
-                isLive: true,
-                url: streamUrlToPlay
-            }, mpegtsConfig);
-
-            // Track watch progress for mpegts stream
-            if (mediaInfo) {
-                setActiveMediaTracking(mediaInfo);
-            }
-
-            // Setup error handling
-            appState.player.on(mpegts.Events.ERROR, (errorType, errorDetail) => {
-                const errorMsg = `Player Error: ${errorType} - ${errorDetail}`;
-                console.error(`[VOD_PLAYER] MPEGTS Player Error: ${errorMsg}`);
-                logToPlayerConsole(errorMsg, true);
-                showNotification(errorMsg, true);
-                stopAndCleanupPlayer();
-            });
-
-            appState.player.on(mpegts.Events.MEDIA_INFO, () => {
-                console.log('[VOD_PLAYER] Media info received, playback starting.');
-                logToPlayerConsole('Playback started.');
-            });
-
-            // Open modal and set title
-            UIElements.videoModal?.classList.remove('pip-active');
-            openModal(UIElements.videoModal);
-            UIElements.videoTitle.textContent = title;
-            currentChannelInfo = { url, name: title, channelId: null, logo };
-            updateMediaSession(title, logo);
-            requestScreenWakeLock();
-
-            // Hide native controls so our VOD overlay takes over without "LIVE" scrubber locking
-            if (UIElements.videoElement) {
-                UIElements.videoElement.controls = false;
-            }
-
-            // Setup and display VOD controls overlay
-            setupVodControlsOverlay(profile.name);
-
-            // Fetch duration in background if not known
-            if (!currentVodTranscodeSession.duration) {
-                fetch(`/api/vod/duration?url=${encodeURIComponent(url)}`)
-                    .then(res => res.json())
-                    .then(data => {
-                        if (data && data.duration && currentVodTranscodeSession && currentVodTranscodeSession.url === url) {
-                            currentVodTranscodeSession.duration = data.duration;
-                            if (currentActiveMedia) currentActiveMedia.duration = data.duration;
-                            const totalTimeEl = document.getElementById('vod-total-time');
-                            const progressBar = document.getElementById('vod-progress-bar');
-                            if (totalTimeEl) totalTimeEl.textContent = formatTimeSeconds(data.duration);
-                            if (progressBar) progressBar.max = data.duration;
-                            console.log(`[VOD_PLAYER] Probed duration for "${title}": ${data.duration}s`);
-                        }
-                    })
-                    .catch(e => console.warn('[VOD_PLAYER] Could not fetch duration:', e));
-            }
-
-            // Attach and play
-            appState.player.attachMediaElement(UIElements.videoElement);
-            appState.player.load();
-
-            // Set volume from storage
-            UIElements.videoElement.volume = parseFloat(localStorage.getItem('iptvPlayerVolume') || 0.5);
-
-            try {
-                const playPromise = appState.player.play();
-                if (playPromise !== undefined) {
-                    await playPromise;
-                }
-            } catch (playErr) {
-                if (playErr.name !== 'AbortError') {
-                    console.warn('[VOD_PLAYER] play() interrupted:', playErr);
-                }
-            }
-
-            console.log(`[VOD_PLAYER] Transcoded playback started for: "${title}"`);
-            setLocalPlayerState(streamUrlToPlay, title, null);
-
-            // Start stream info interval if needed
-            if (streamInfoInterval) clearInterval(streamInfoInterval);
-            streamInfoInterval = setInterval(updateStreamInfo, 2000);
-
-        } catch (err) {
-            const errorMsg = `Failed to initialize mpegts.js player: ${err.message}`;
-            console.error("[VOD_PLAYER] Error initializing mpegts.js player:", err);
-            logToPlayerConsole(errorMsg, true);
-            showNotification(errorMsg, true);
-            await stopAndCleanupPlayer();
-        }
-
-    } else {
-        const errorMsg = 'Your browser does not support Media Source Extensions (MSE), required for playback via profiles.';
-        showNotification(errorMsg, true);
-        logToPlayerConsole(errorMsg, true);
-        console.error("[VOD_PLAYER] MSE not supported.");
-    }
-};
 
 /**
  * Detects and populates available audio tracks in the menu.
@@ -1669,30 +958,12 @@ export function setupPlayerEventListeners() {
             }
         });
 
-        // Close on Escape key or seek transcoded VOD on ArrowLeft/Right
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape' && !moreOptionsMenu.classList.contains('hidden')) {
                 moreOptionsMenu.classList.add('hidden');
                 return;
             }
 
-            // Keyboard seeking for transcoded VOD streams via -ss
-            if (currentVodTranscodeSession && UIElements.videoModal && !UIElements.videoModal.classList.contains('hidden')) {
-                // Ignore if typing in an input (except if it's the vod-progress-bar)
-                if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName) && document.activeElement?.id !== 'vod-progress-bar') return;
-
-                if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
-                    e.preventDefault();
-                    const delta = (e.shiftKey ? 60 : 15) * (e.key === 'ArrowRight' ? 1 : -1);
-                    seekVodRelative(delta);
-                } else if (e.key === ' ' || e.code === 'Space') {
-                    e.preventDefault();
-                    if (UIElements.videoElement) {
-                        if (UIElements.videoElement.paused) UIElements.videoElement.play();
-                        else UIElements.videoElement.pause();
-                    }
-                }
-            }
         });
     }
 
@@ -1780,24 +1051,14 @@ export function setupPlayerEventListeners() {
             requestScreenWakeLock();
         }
         if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-        sendTelemetry('MEDIA_PLAYING', 'Video element entered playing state', {
-            currentTime: UIElements.videoElement?.currentTime,
-            visibilityState: document.visibilityState
-        });
+
     });
     UIElements.videoElement.addEventListener('pause', () => {
-        saveCurrentWatchProgress(true);
 
         if (!document.pictureInPictureElement) {
             releaseScreenWakeLock();
         }
         if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-        sendTelemetry('MEDIA_PAUSE', `Video element paused event (visibility: ${document.visibilityState})`, {
-            currentTime: UIElements.videoElement?.currentTime,
-            visibilityState: document.visibilityState,
-            isUserInitiatedPause,
-            pipActive: !!document.pictureInPictureElement
-        });
 
         // Ignore internal OS pause event fired when leaving/docking Picture-in-Picture
         if (isTransitioningFromPip) {
@@ -1811,10 +1072,7 @@ export function setupPlayerEventListeners() {
         }
     });
     UIElements.videoElement.addEventListener('ended', () => {
-        if (currentActiveMedia) {
-            saveWatchProgressApi(currentActiveMedia.contentType, currentActiveMedia.contentId, 0, currentActiveMedia.duration || 0);
-            currentActiveMedia = null;
-        }
+
         releaseScreenWakeLock();
         releaseTabDiscardLock();
         if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none';
@@ -1929,25 +1187,19 @@ export function setupPlayerEventListeners() {
         updateSubtitleTrackList();
     });
 
-    // Unload handlers to cleanly notify the server and close active redirect stream session on tab/browser close
     const handleUnload = (e) => {
         // Flush active watch progress to preserve playback state
-        if (currentActiveMedia) {
-            flushWatchProgress();
-        }
 
         // If page is entering background cache (persisted), do not stop stream!
         if (e && e.persisted) {
             return;
         }
         // If stream is active and not an intentional user pause, this is mobile pagehide on screen-lock/home swipe - do NOT stop the stream!
-        const hasActiveStream = !!(appState.player || appState.hlsPlayer || currentLocalStreamUrl || currentStreamUrlToPlay || currentRedirectHistoryId);
+        const hasActiveStream = !!(appState.player || appState.hlsPlayer || currentLocalStreamUrl || currentStreamUrlToPlay);
         if (hasActiveStream && !isUserInitiatedPause) {
             return;
         }
-        if (currentRedirectHistoryId) {
-            stopRedirectStream(currentRedirectHistoryId, true);
-        }
+
     };
     window.addEventListener('pagehide', handleUnload);
     window.addEventListener('beforeunload', handleUnload);

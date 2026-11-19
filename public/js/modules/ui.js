@@ -5,29 +5,21 @@
  */
 
 import { UIElements, appState, guideState } from './state.js';
-import { refreshUserList, updateUIFromSettings } from './settings.js';
-import { loadAndScheduleNotifications, renderNotifications } from './notification.js';
-import { initMultiView, isMultiViewActive, cleanupMultiView } from './multiview.js';
-import { initDvrPage } from './dvr.js';
-import { stopAndCleanupPlayer } from './player.js';
-import { initDirectPlayer, isDirectPlayerActive, cleanupDirectPlayer } from './player_direct.js';
-import { finalizeGuideLoad, handleGuideLoad } from './guide.js';
-import { fetchConfig, saveUserSetting, saveDeviceSetting } from './api.js';
-import { initActivityPage } from './admin.js';
-import { initVodPage } from './vod.js';
-import { sendTelemetry } from './telemetry.js';
 
+import { initMultiView, isMultiViewActive, cleanupMultiView } from './multiview.js';
+
+import { stopAndCleanupPlayer } from './player.js';
+
+import { finalizeGuideLoad, handleGuideLoad } from './guide.js';
+import { fetchConfig, savePreference, saveDeviceSetting } from './api.js';
 
 let confirmCallback = null;
 let currentPage = '/';
 let activeModalCloseListener = null;
 let isResizing = false;
 // FINAL FIX: Flag to temporarily block config reloads after a setting is saved.
-let blockConfigReload = false;
 
 // NEW: Exported variable to track if processing is running
-export let isProcessingRunning = false;
-
 
 /**
  * Shows a notification message at the top-right of the screen.
@@ -74,7 +66,7 @@ export const openModal = (modal) => {
 
             // Bottom 36px exclusion zone: home gesture swipe area on modern iOS / Android
             if (startY > window.innerHeight - 36) {
-                sendTelemetry('BACKDROP_TOUCH', 'Touch in bottom 36px exclusion zone -> ignored', { startX, startY, exclusionZone: window.innerHeight - 36 });
+
                 return;
             }
 
@@ -87,9 +79,7 @@ export const openModal = (modal) => {
 
                 // Ignore if it was a drag, swipe, or long press (>10px movement or >400ms duration)
                 if (distance > 10 || duration > 400) {
-                    sendTelemetry('BACKDROP_TOUCH', `Backdrop swipe/drag ignored (distance: ${distance.toFixed(1)}px, duration: ${duration}ms)`, {
-                        startX, startY, endX, endY, distance, duration
-                    });
+
                     cleanupListeners();
                     return;
                 }
@@ -100,11 +90,7 @@ export const openModal = (modal) => {
                         cleanupListeners();
                         return;
                     }
-                    sendTelemetry('BACKDROP_TOUCH', `Backdrop tap detected -> triggering ${modal === UIElements.videoModal || modal.id === 'video-modal' ? 'stopAndCleanupPlayer()' : 'closeModal()'}`, {
-                        modalId: modal.id,
-                        startX, startY, endX, endY, distance, duration,
-                        targetId: target?.id || target?.tagName
-                    }, true);
+
                     if (modal === UIElements.videoModal || modal.id === 'video-modal') {
                         stopAndCleanupPlayer();
                     } else {
@@ -154,7 +140,6 @@ export const closeModal = (modal) => {
     }
 };
 
-
 /**
  * Shows a confirmation dialog.
  * @param {string} title - The title of the confirmation dialog.
@@ -172,49 +157,12 @@ export const showConfirm = (title, message, callback) => {
  * NEW: Displays a site-wide broadcast message banner at the top of the page.
  * @param {string} message - The message to display.
  */
-export const showBroadcastMessage = (message) => {
-    const container = UIElements.broadcastBannerContainer;
-    if (!container) return;
-
-    const banner = document.createElement('div');
-    banner.className = 'broadcast-banner';
-    banner.textContent = message;
-
-    container.appendChild(banner);
-
-    // Use a short timeout to allow the element to be in the DOM before adding the class to trigger the transition
-    setTimeout(() => {
-        banner.classList.add('visible');
-    }, 50);
-
-    // Hide the banner after 10 seconds
-    setTimeout(() => {
-        banner.classList.remove('visible');
-        // Remove the element from the DOM after the transition ends
-        banner.addEventListener('transitionend', () => {
-            if (banner.parentElement) {
-                banner.remove();
-            }
-        });
-    }, 10000);
-};
 
 export function handleConfirm() {
     if (confirmCallback) {
         confirmCallback();
     }
     closeModal(UIElements.confirmModal);
-}
-
-export function formatPlaybackTime(seconds) {
-    const s = Math.max(0, Math.floor(seconds));
-    const hrs = Math.floor(s / 3600);
-    const mins = Math.floor((s % 3600) / 60);
-    const secs = s % 60;
-    if (hrs > 0) {
-        return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-    }
-    return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
 /**
@@ -227,63 +175,6 @@ export function formatPlaybackTime(seconds) {
  * @param {Function} options.onStartOver - Callback when user chooses to start over from 0.
  * @param {Function} [options.onCancel] - Optional callback when user cancels without playing.
  */
-export const showResumePrompt = ({ title, progressSeconds, durationSeconds = 0, onResume, onStartOver, onCancel = null }) => {
-    const modal = UIElements.resumePlaybackModal || document.getElementById('resume-playback-modal');
-    if (!modal) {
-        if (typeof onResume === 'function') onResume();
-        return;
-    }
-
-    const titleEl = UIElements.resumePlaybackTitle || document.getElementById('resume-playback-title');
-    const msgEl = UIElements.resumePlaybackMessage || document.getElementById('resume-playback-message');
-    const confirmBtn = UIElements.resumePlaybackConfirmBtn || document.getElementById('resume-playback-confirm-btn');
-    const labelEl = UIElements.resumePlaybackConfirmLabel || document.getElementById('resume-playback-confirm-label');
-    const restartBtn = UIElements.resumePlaybackRestartBtn || document.getElementById('resume-playback-restart-btn');
-    const closeBtn = UIElements.resumePlaybackCloseBtn || document.getElementById('resume-playback-close-btn');
-
-    const formattedProgress = formatPlaybackTime(progressSeconds);
-    const formattedDuration = durationSeconds > 0 ? formatPlaybackTime(durationSeconds) : null;
-
-    if (titleEl) titleEl.textContent = title || 'Playback';
-    if (labelEl) labelEl.textContent = `Resume (${formattedProgress})`;
-
-    let messageText = `You were watching at <span class="font-bold text-blue-400">${formattedProgress}</span>`;
-    if (formattedDuration) {
-        messageText += ` (total: ${formattedDuration})`;
-    }
-    messageText += `. Would you like to resume where you left off or start over from the beginning?`;
-    if (msgEl) msgEl.innerHTML = messageText;
-
-    const cleanup = () => {
-        closeModal(modal);
-        if (confirmBtn) confirmBtn.onclick = null;
-        if (restartBtn) restartBtn.onclick = null;
-        if (closeBtn) closeBtn.onclick = null;
-    };
-
-    if (confirmBtn) {
-        confirmBtn.onclick = () => {
-            cleanup();
-            if (typeof onResume === 'function') onResume();
-        };
-    }
-
-    if (restartBtn) {
-        restartBtn.onclick = () => {
-            cleanup();
-            if (typeof onStartOver === 'function') onStartOver();
-        };
-    }
-
-    if (closeBtn) {
-        closeBtn.onclick = () => {
-            cleanup();
-            if (typeof onCancel === 'function') onCancel();
-        };
-    }
-
-    openModal(modal);
-};
 
 /**
  * Sets the loading state of a button, showing a spinner.
@@ -499,208 +390,40 @@ export const closeMobileMenu = () => {
  * Temporarily blocks the automatic config reload that happens on navigation.
  * This prevents the UI from overwriting a user's new setting with old data from the server.
  */
-export const tempBlockConfigReload = () => {
-    blockConfigReload = true;
-    console.log(`%c[DEBUG] RACE_CONDITION_FIX: Config reload temporarily BLOCKED.`, 'color: #fca5a5; font-weight: bold;');
-    setTimeout(() => {
-        blockConfigReload = false;
-        console.log(`%c[DEBUG] RACE_CONDITION_FIX: Config reload UNBLOCKED.`, 'color: #86efac; font-weight: bold;');
-    }, 1000); // Block for 1 second, plenty of time for the save to complete.
-};
-
 
 /**
  * Handles client-side routing by showing/hiding pages.
  */
 export const handleRouteChange = () => {
-    const wasMultiView = currentPage.startsWith('/multiview');
-    const wasPlayer = currentPage.startsWith('/player');
-    const path = window.location.pathname;
-
-    if (wasMultiView && !path.startsWith('/multiview')) {
-        if (isMultiViewActive()) {
-            showConfirm(
-                'Leave Multi-View?',
-                'Leaving this page will stop all streams and clear your current layout. Are you sure?',
-                () => {
-                    cleanupMultiView();
-                    proceedWithRouteChange(path);
-                }
-            );
-            window.history.pushState({}, currentPage, window.location.origin + currentPage);
-            return;
-        } else {
-            cleanupMultiView();
-        }
+    let path = window.location.pathname;
+    if (!['/', '/tvguide', '/multiview'].includes(path)) {
+        path = '/tvguide';
+        window.history.replaceState({}, '', path);
     }
-
-    if (wasPlayer && !path.startsWith('/player')) {
-        if (isDirectPlayerActive()) {
-            showConfirm(
-                'Leave Player?',
-                'Leaving this page will stop the current stream. Are you sure?',
-                () => {
-                    cleanupDirectPlayer();
-                    proceedWithRouteChange(path);
-                }
-            );
-            window.history.pushState({}, currentPage, window.location.origin + currentPage);
-            return;
-        } else {
-            cleanupDirectPlayer();
-        }
-    }
-
+    if (currentPage.startsWith('/multiview') && path !== '/multiview') cleanupMultiView();
     proceedWithRouteChange(path);
 };
-
-/**
- * The core logic for switching pages after checks have passed.
- * MODIFIED: Now handles visibility of Settings and DVR tabs based on admin/user permissions.
- * @param {string} path - The new path to render.
- */
 async function proceedWithRouteChange(path) {
-    const isGuide = path.startsWith('/tvguide') || path === '/';
-    const isMultiView = path.startsWith('/multiview');
-    const isPlayer = path.startsWith('/player');
-    const isDvr = path.startsWith('/dvr');
-    const isVod = path.startsWith('/vod');
-    const isActivity = path.startsWith('/activity');
-    const isNotifications = path.startsWith('/notifications');
-    const isSettings = path.startsWith('/settings');
-
+    const isGuide = path !== '/multiview';
     closeMobileMenu();
-
-    const isAdmin = appState.currentUser?.isAdmin;
-
-    // Toggle desktop and mobile nav button visibility and active state
     UIElements.tabGuide?.classList.toggle('active', isGuide);
     UIElements.mobileNavGuide?.classList.toggle('active', isGuide);
-
-    UIElements.tabMultiview?.classList.toggle('active', isMultiView);
-    UIElements.mobileNavMultiview?.classList.toggle('active', isMultiView);
-
-    UIElements.tabPlayer?.classList.toggle('active', isPlayer);
-    UIElements.mobileNavPlayer?.classList.toggle('active', isPlayer);
-
-    // DVR tab is visible to all users to see completed recordings
-    if (UIElements.tabDvr) UIElements.tabDvr.classList.toggle('active', isDvr);
-    if (UIElements.mobileNavDvr) UIElements.mobileNavDvr.classList.toggle('active', isDvr);
-
-    // VOD tab is visible to all
-    if (UIElements.tabVod) UIElements.tabVod.classList.toggle('active', isVod);
-    if (UIElements.mobileNavVod) UIElements.mobileNavVod.classList.toggle('active', isVod);
-    // --- END ADD ---
-
-    // Activity tab is for admins only
-    if (UIElements.tabActivity) {
-        UIElements.tabActivity.classList.toggle('active', isActivity && isAdmin);
-        UIElements.tabActivity.classList.toggle('hidden', !isAdmin);
-    }
-    if (UIElements.mobileNavActivity) {
-        UIElements.mobileNavActivity.classList.toggle('active', isActivity && isAdmin);
-        UIElements.mobileNavActivity.classList.toggle('hidden', !isAdmin);
-    }
-
-    UIElements.tabNotifications?.classList.toggle('active', isNotifications);
-    UIElements.mobileNavNotifications?.classList.toggle('active', isNotifications);
-
-    // Settings tab is for admins only
-    if (UIElements.tabSettings) {
-        UIElements.tabSettings.classList.toggle('active', isSettings && isAdmin);
-        UIElements.tabSettings.classList.toggle('hidden', !isAdmin);
-    }
-    if (UIElements.mobileNavSettings) {
-        UIElements.mobileNavSettings.classList.toggle('active', isSettings && isAdmin);
-        UIElements.mobileNavSettings.classList.toggle('hidden', !isAdmin);
-    }
-
-    // Toggle page visibility
+    UIElements.tabMultiview?.classList.toggle('active', !isGuide);
+    UIElements.mobileNavMultiview?.classList.toggle('active', !isGuide);
     UIElements.pageGuide.classList.toggle('hidden', !isGuide);
     UIElements.pageGuide.classList.toggle('flex', isGuide);
-
-    UIElements.pageMultiview.classList.toggle('hidden', !isMultiView);
-    UIElements.pageMultiview.classList.toggle('flex', isMultiView);
-
-    UIElements.pagePlayer.classList.toggle('hidden', !isPlayer);
-    UIElements.pagePlayer.classList.toggle('flex', isPlayer);
-
-    // Show DVR page to everyone; content inside is handled by dvr.js
-    UIElements.pageDvr.classList.toggle('hidden', !isDvr);
-    UIElements.pageDvr.classList.toggle('flex', isDvr);
-
-    // Show VOD page to everyone
-    UIElements.pageVod.classList.toggle('hidden', !isVod);
-    UIElements.pageVod.classList.toggle('flex', isVod);
-    // --- END ADD ---
-
-    UIElements.pageActivity.classList.toggle('hidden', !isActivity || !isAdmin);
-    UIElements.pageActivity.classList.toggle('flex', isActivity && isAdmin);
-
-    UIElements.pageNotifications.classList.toggle('hidden', !isNotifications);
-    UIElements.pageNotifications.classList.toggle('flex', isNotifications);
-
-    // Show settings page only to admins
-    UIElements.pageSettings.classList.toggle('hidden', !isSettings || !isAdmin);
-    UIElements.pageSettings.classList.toggle('flex', isSettings && isAdmin);
-
-    const appContainer = UIElements.appContainer;
-
+    UIElements.pageMultiview.classList.toggle('hidden', isGuide);
+    UIElements.pageMultiview.classList.toggle('flex', !isGuide);
     if (isGuide) {
-        if (appContainer) appContainer.classList.remove('header-collapsed');
-        if (UIElements.guideContainer) UIElements.guideContainer.scrollTop = 0;
-
-        if (blockConfigReload) {
-            console.log(`%c[DEBUG] RACE_CONDITION_FIX: Navigation to Guide tab occurred while config reload was blocked. Skipping reload.`, 'color: #fca5a5; font-weight: bold;');
-            return;
+        const config = await fetchConfig();
+        if (config) {
+            Object.assign(guideState.settings, config.settings);
+            await handleGuideLoad(config.m3uContent, config.epgContent);
         }
-
-        if (!appState.isNavigating) {
-            console.log('[UI] Refreshing TV Guide data on tab switch.');
-            const config = await fetchConfig();
-            if (config) {
-                Object.assign(guideState.settings, config.settings || {});
-                // --- FIX: Add VOD data to the global state ---
-                //guideState.vodMovies = config.vodMovies || [];
-                //guideState.vodSeries = config.vodSeries || [];
-                finalizeGuideLoad(true);
-            }
-        } else {
-            console.log('[UI] Skipping soft refresh because a navigation action is in progress.');
-        }
-
-    } else {
-        if (appContainer) appContainer.classList.remove('header-collapsed');
-
-        if (isSettings && isAdmin) {
-            if (blockConfigReload) {
-                console.log(`%c[DEBUG] RACE_CONDITION_FIX: Navigation to Settings tab occurred while config reload was blocked. Skipping reload.`, 'color: #fca5a5; font-weight: bold;');
-            } else {
-                updateUIFromSettings();
-                if (appState.currentUser?.isAdmin) refreshUserList();
-            }
-        } else if (isNotifications) {
-            await loadAndScheduleNotifications();
-        } else if (isMultiView) {
-            initMultiView();
-        } else if (isPlayer) {
-            initDirectPlayer();
-        } else if (isDvr) { // DVR page init is now called for all users
-            await initDvrPage();
-        } else if (isVod) {
-            await initVodPage();
-        } else if (isActivity && isAdmin) {
-            await initActivityPage();
-        }
-    }
+    } else initMultiView();
     currentPage = path;
 }
 
-
-/**
- * Pushes a new state to the browser history and triggers a route change.
- * @param {string} path - The new path to navigate to.
- */
 export const navigate = (path) => {
     if (window.location.pathname !== path) {
         window.history.pushState({}, path, window.location.origin + path);
@@ -712,208 +435,4 @@ export const navigate = (path) => {
  * Switches between the tabs.
  * @param {string} activeTab - The tab to switch to.
  */
-export const switchTab = (activeTab) => {
-    let newPath;
-    if (activeTab === 'guide') newPath = '/tvguide';
-    else if (activeTab === 'multiview') newPath = '/multiview';
-    else if (activeTab === 'player') newPath = '/player';
-    else if (activeTab === 'dvr') newPath = '/dvr';
-    else if (activeTab === 'vod') newPath = '/vod';
-    else if (activeTab === 'activity') newPath = '/activity';
-    else if (activeTab === 'notifications') newPath = '/notifications';
-    else newPath = '/settings';
-    navigate(newPath);
-};
-
-// Variable to track the last processing status to determine the action of the main button
-// let isProcessingRunning = false; //commenting this out as it's exported above
-
-// MODIFIED: Add export to this function
-/**
- * NEW: Initiates a refresh of the TV Guide with new data.
- * FIXED: Reordered operations to fix race condition - navigate first, then load data.
- * FIXED: Set isNavigating flag to prevent navigation from triggering competing guide load.
- * FIXED: Load guide data BEFORE navigating to ensure DOM is ready for centering.
- */
-export async function refreshGuideAfterProcessing() {
-    console.log('[UI_PROCESS] Finalizing process and refreshing guide...');
-
-    // 1. Close the modal first
-    closeModal(UIElements.processingStatusModal);
-
-    // 2. Fetch the absolute latest config from the server FIRST
-    const config = await fetchConfig();
-    console.log('[UI_PROCESS_DEBUG] Config fetched:', config ? 'SUCCESS' : 'NULL');
-    console.log('[UI_PROCESS_DEBUG] m3uContent exists:', !!config?.m3uContent);
-    console.log('[UI_PROCESS_DEBUG] m3uContent length:', config?.m3uContent?.length || 0);
-
-    // 3. Update the global state
-    if (config) {
-        Object.assign(guideState.settings, config.settings || {});
-    }
-
-    // 4. Load guide data FIRST (this processes and stores the data in memory)
-    // Do NOT render yet - just parse and store
-    if (config?.m3uContent) {
-        console.log('[UI_PROCESS_DEBUG] About to parse guide data (no render yet)...');
-        await guideState.settings.timezoneOffset; // Ensure timezone is set before parsing
-
-        // Parse the M3U and store in guideState (from handleGuideLoad logic)
-        const { parseM3U } = await import('./utils.js');
-        guideState.channels = parseM3U(config.m3uContent);
-        guideState.programs = config.epgContent || {};
-
-        // Store in IndexedDB
-        if (appState.db) {
-            await appState.db.transaction(['guideData'], 'readwrite').objectStore('guideData').put(guideState.channels, 'channels');
-            await appState.db.transaction(['guideData'], 'readwrite').objectStore('guideData').put(guideState.programs, 'programs');
-        }
-
-        console.log('[UI_PROCESS_DEBUG] Guide data parsed and stored. Channels:', guideState.channels.length);
-
-        // 5. NOW navigate to the guide tab
-        // Set flag to prevent competing load
-        appState.isNavigating = true;
-        navigate('/tvguide');
-
-        // 6. CRITICAL: Wait for the guide page to be FULLY VISIBLE before rendering
-        // This ensures the page container is visible so DOM queries work
-        await new Promise(resolve => {
-            const checkVisible = () => {
-                const guidePage = document.getElementById('page-guide');
-
-                // Only check if the PAGE is visible, not the grid
-                // (the grid visibility is controlled by renderGuide itself)
-                if (guidePage && !guidePage.classList.contains('hidden')) {
-                    console.log('[UI_PROCESS_DEBUG] Guide page is now visible');
-                    resolve();
-                } else {
-                    requestAnimationFrame(checkVisible);
-                }
-            };
-            checkVisible();
-        });
-
-        // 7. NOW render the guide with centering using the pre-loaded data
-        console.log('[UI_PROCESS_DEBUG] About to finalize guide load with shouldCenter=true');
-        await import('./guide.js').then(module => module.finalizeGuideLoad(true));
-        console.log('[UI_PROCESS_DEBUG] Guide finalized - render complete');
-
-        // 8. Reset navigation flag
-        appState.isNavigating = false;
-
-        showNotification('Sources processed. TV Guide updated!', false, 4000);
-    } else {
-        console.log('[UI_PROCESS_DEBUG] Skipping handleGuideLoad - no m3uContent');
-        showNotification('Sources processed, but no guide data found.', true, 4000);
-    }
-
-    // 9. Update settings page UI for source status indicators
-    import('./settings.js').then(module => module.updateUIFromSettings());
-}
-
-
-/**
- * NEW: Shows and resets the processing status modal.
- */
-export function showProcessingModal() {
-    const modal = UIElements.processingStatusModal;
-    const logContainer = UIElements.processingStatusLog;
-
-    if (!modal || !logContainer || !UIElements.processingStatusBackgroundBtn || !UIElements.processingStatusCloseRefreshBtn || !UIElements.processingStatusRunningActions || !UIElements.processingStatusFinishedActions) {
-        console.error('[UI_PROCESS] Missing processing modal elements in UIElements.');
-        return;
-    }
-
-    // Reset the modal state
-    logContainer.innerHTML = '';
-    isProcessingRunning = true; // Assume running when modal is first opened
-
-    // Hide all action buttons initially
-    UIElements.processingStatusRunningActions.classList.remove('hidden');
-    UIElements.processingStatusFinishedActions.classList.add('hidden');
-    UIElements.processingStatusBackgroundBtn.classList.remove('hidden');
-
-    // 1. Setup 'Continue in the background' button
-    UIElements.processingStatusBackgroundBtn.onclick = () => {
-        closeModal(modal);
-        showNotification('Processing continued in the background.');
-        // The main process-sources-btn listener is set up in settings.js to handle reopening
-    };
-
-    // 2. Setup 'Close and refresh' button
-    UIElements.processingStatusCloseRefreshBtn.onclick = refreshGuideAfterProcessing;
-
-    openModal(modal);
-}
-
-// MODIFIED: updateProcessingStatus function
-/**
- * NEW: Updates the content of the processing status modal.
- * @param {string} message - The log message to display.
- * @param {string} type - The type of message ('info', 'success', 'error', 'final_success').
- */
-export function updateProcessingStatus(message, type = 'info') {
-    const logContainer = UIElements.processingStatusLog;
-    const modal = UIElements.processingStatusModal; // Get a reference to the modal
-
-    // --- New Button Logic ---
-    const runningActionsEl = UIElements.processingStatusRunningActions;
-    const finishedActionsEl = UIElements.processingStatusFinishedActions;
-    // --- End New Button Logic ---
-
-    if (!logContainer || !runningActionsEl || !finishedActionsEl || !modal) return;
-
-    const logEntry = document.createElement('p');
-    const timestamp = new Date().toLocaleTimeString();
-    let typeIndicator = '';
-    let colorClass = 'text-gray-400';
-    let isFinished = false;
-
-    switch (type) {
-        case 'success':
-            typeIndicator = '[SUCCESS]';
-            colorClass = 'text-green-400';
-            break;
-        case 'final_success':
-            typeIndicator = '[SUCCESS]';
-            colorClass = 'text-green-400';
-            isFinished = true;
-            break;
-        case 'error':
-            typeIndicator = '[ERROR]';
-            colorClass = 'text-red-400';
-            isFinished = true;
-            break;
-        case 'info':
-        default:
-            typeIndicator = '[INFO]';
-            break;
-    }
-
-    logEntry.innerHTML = `<span class="text-gray-500">${timestamp}</span> <span class="${colorClass} font-semibold">${typeIndicator}</span> <span class="${colorClass}">${message}</span>`;
-    logContainer.appendChild(logEntry);
-
-    // Auto-scroll to the bottom
-    logContainer.scrollTop = logContainer.scrollHeight;
-
-    // Update button visibility based on completion
-    if (isFinished) {
-        isProcessingRunning = false;
-        runningActionsEl.classList.add('hidden');
-        finishedActionsEl.classList.remove('hidden');
-
-        // *** NEW LOGIC ***
-        // If the process is finished and the modal is hidden (running in background),
-        // dispatch a global event to notify the app.
-        if (modal.classList.contains('hidden')) {
-            console.log('[UI_PROCESS] Background process finished. Dispatching event.');
-            document.dispatchEvent(new CustomEvent('background-process-finished'));
-        }
-        // *** END NEW LOGIC ***
-
-    } else {
-        runningActionsEl.classList.remove('hidden');
-        finishedActionsEl.classList.add('hidden');
-    }
-}
+export const switchTab = tab => navigate(tab === 'multiview' ? '/multiview' : '/tvguide');

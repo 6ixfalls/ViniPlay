@@ -1,0 +1,4 @@
+node_modules/
+viniplay-data/
+viniplay-dvr/
+npm-debug.log*

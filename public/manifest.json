@@ -1,7 +1,7 @@
 {
   "name": "ViniPlay",
   "short_name": "ViniPlay",
-  "description": "Self-hosted IPTV and VOD streaming platform",
+  "description": "Live IPTV player with browser preferences",
   "id": "/",
   "start_url": "/",
   "scope": "/",

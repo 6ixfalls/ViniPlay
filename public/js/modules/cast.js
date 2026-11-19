@@ -109,7 +109,6 @@ window['__onGCastApiAvailable'] = (isAvailable) => {
     }
 };
 
-
 /**
  * Handles changes in the Cast session state.
  * @param {chrome.cast.SessionStateEventData} event - The session state event.
@@ -217,7 +216,6 @@ function updatePlayerUI() {
     }
 }
 
-
 /**
  * Loads a media stream onto the connected Cast device.
  * @param {string} url - The URL of the stream.
@@ -247,30 +245,6 @@ export async function loadMedia(url, name, logo) {
             castUrl = `${url}${separator}profileId=${activeCastProfileId}`;
             console.log(`[CAST] Added ${activeCastProfileId} profile`);
         }
-    }
-
-    // Generate and append cast authentication token
-    try {
-        console.log('[CAST] Requesting authentication token...');
-        const response = await fetch('/api/cast/generate-token', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ streamUrl: url })
-        });
-
-        if (!response.ok) {
-            throw new Error(`Token generation failed: ${response.status}`);
-        }
-
-        const { token } = await response.json();
-        const separator = castUrl.includes('?') ? '&' : '?';
-        castUrl = `${castUrl}${separator}castToken=${token}`;
-
-        console.log('[CAST] Authentication token added to URL');
-    } catch (error) {
-        console.error('[CAST] Failed to generate cast token:', error);
-        showNotification('Failed to generate cast authentication token', true);
-        return;
     }
 
     console.log(`[CAST] Cast URL ready for Chromecast`);
