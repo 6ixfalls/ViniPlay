@@ -45,7 +45,7 @@ async function pauseAndClearAllPlayers() {
     // 2. Stop server-side streams and pause client-side players
     const stopPromises = [];
     for (const [widgetId, player] of players.entries()) {
-        // Stop the server-side ffmpeg process
+        // Release the server-side proxy connection
         if (playerUrls.has(widgetId)) {
             const originalUrl = playerUrls.get(widgetId);
             console.log(`[MultiView] Tab Hide: Sending stop request for widget ${widgetId}, URL: ${originalUrl}`);

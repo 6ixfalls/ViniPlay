@@ -524,7 +524,7 @@ export const stopAndCleanupPlayer = async () => { // MODIFIED: Made function asy
     retryCount = 0;
     currentChannelInfo = null;
 
-    // Explicitly tell the server to stop the stream process.
+    // Notify the server before disconnecting the local playback response.
     if (currentLocalStreamUrl && !castState.isCasting) {
         console.log(`[PLAYER] Sending stop request to server for URL: ${currentLocalStreamUrl} with Profile ID: ${currentProfileId}`);
         await stopStream(currentLocalStreamUrl, currentProfileId);
@@ -724,14 +724,15 @@ export const playChannel = (url, name, channelId) => {
             liveBufferLatency: 2.0,
         };
 
-        appState.player = mpegts.createPlayer({
+        const player = appState.player = mpegts.createPlayer({
             type: 'mse',
             isLive: true,
             url: streamUrlToPlay
         }, mpegtsConfig);
 
         // --- NEW: Robust Error Handling ---
-        appState.player.on(mpegts.Events.ERROR, (errorType, errorDetail) => {
+        player.on(mpegts.Events.ERROR, (errorType, errorDetail) => {
+            if (appState.player !== player) return;
             console.error(`[PLAYER] MPEGTS Player Error: Type=${errorType}, Detail=${errorDetail}`);
             // We only want to auto-retry on unrecoverable network/media errors.
             if (errorType === 'NetworkError' || errorType === 'MediaError') {
@@ -746,7 +747,8 @@ export const playChannel = (url, name, channelId) => {
         });
 
         // When playback starts successfully, reset the retry counter.
-        appState.player.on(mpegts.Events.MEDIA_INFO, () => {
+        player.on(mpegts.Events.MEDIA_INFO, () => {
+            if (appState.player !== player) return;
             console.log('[PLAYER] Media info received, playback started successfully.');
             retryCount = 0;
             if (retryTimeout) {
@@ -780,7 +782,8 @@ export const playChannel = (url, name, channelId) => {
 
         UIElements.videoElement.volume = parseFloat(localStorage.getItem('iptvPlayerVolume') || 0.5);
 
-        appState.player.play().catch((err) => {
+        player.play().catch((err) => {
+            if (err.name === 'AbortError' || appState.player !== player) return;
             console.error("MPEGTS Player play() caught an error:", err);
             // This initial play error is often critical, so we start the retry process.
             handleStreamError();

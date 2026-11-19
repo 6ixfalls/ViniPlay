@@ -4,13 +4,12 @@ const { loadProvider, clientSettings, STREAM_PROFILE, CAST_PROFILE } = require('
 const provider = loadProvider(process.env);
 const express = require('express');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { proxyStream } = require('./stream-proxy');
+const { streamCast } = require('./cast-stream');
 const { fetchResource, parseFeeds } = require('./feeds');
-const { broadcastStream } = require('./stream-broadcast');
 
 const app = express();
 const port = Number(process.env.PORT || 8998);
-const streams = new Map();
 const clients = new Set();
 let feed, updatedAt;
 let refreshInProgress = null;
@@ -55,40 +54,8 @@ app.get('/stream', (req, res) => {
     const cast = profileId === CAST_PROFILE.id;
     res.set({ 'Content-Type': cast ? 'video/mp4' : 'video/mp2t', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
     if (req.method === 'HEAD') return res.end();
-    const key = cast ? Symbol(profileId) : `${address}::${profileId}`;
-    let stream = streams.get(key);
-    if (!stream) {
-        const args = ['-hide_banner', '-loglevel', 'error', '-user_agent', 'VLC/3.0.20', '-i', address,
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-b:a', '128k',
-            ...(cast ? ['-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4'] : ['-f', 'mpegts']), 'pipe:1'];
-        const process = spawn('ffmpeg', args);
-        stream = { process, responses: new Set() };
-        streams.set(key, stream);
-        broadcastStream(process.stdout, stream.responses);
-        process.stderr.on('data', () => { /* Avoid logging provider credentials from FFmpeg diagnostics. */ });
-        process.on('error', () => {
-            for (const response of stream.responses) {
-                if (!response.headersSent) response.status(502).end('Could not start the stream proxy.');
-                else response.destroy();
-            }
-            streams.delete(key);
-        });
-        process.on('close', code => {
-            for (const response of stream.responses) {
-                if (code && !response.headersSent) response.status(502).end('The upstream stream could not be played.');
-                else response.end();
-            }
-            if (streams.get(key) === stream) streams.delete(key);
-        });
-    }
-    stream.responses.add(res);
-    res.on('close', () => {
-        stream.responses.delete(res);
-        if (stream.responses.size === 0) {
-            stream.process.kill();
-            if (streams.get(key) === stream) streams.delete(key);
-        }
-    });
+    if (cast) return streamCast(address, res, provider.streamUserAgent);
+    proxyStream(address, req, res, provider.streamUserAgent);
 });
 app.post('/api/stream/stop', (req, res) => {
     // Disconnecting the video response releases its proxy. A stop request must

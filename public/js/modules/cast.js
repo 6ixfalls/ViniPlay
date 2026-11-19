@@ -249,7 +249,7 @@ export async function loadMedia(url, name, logo) {
 
     console.log(`[CAST] Cast URL ready for Chromecast`);
 
-    // Use video/mp4 instead of video/mp2t for Chromecast compatibility
+    // The Cast profile repackages upstream MPEG-TS into fragmented MP4.
     const mediaInfo = new chrome.cast.media.MediaInfo(castUrl, 'video/mp4');
     mediaInfo.streamType = chrome.cast.media.StreamType.LIVE;
     mediaInfo.metadata = new chrome.cast.media.TvShowMediaMetadata();

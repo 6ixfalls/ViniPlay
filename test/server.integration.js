@@ -5,28 +5,29 @@ const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const zlib = require('node:zlib');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 
 test('live server proxies fixed feeds and playback without persistent server state', { skip: !process.env.VINIPLAY_INTEGRATION, timeout: 30000 }, async t => {
+    const fixture = spawnSync('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'color=size=160x90:rate=10',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+        '-t', '1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-g', '10',
+        '-c:a', 'aac', '-f', 'mpegts', 'pipe:1'
+    ]);
+    assert.equal(fixture.status, 0, fixture.error?.message || fixture.stderr.toString());
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'viniplay-integration-'));
-    const bin = path.join(dir, 'bin');
-    fs.mkdirSync(bin);
-    // A deterministic FFmpeg stand-in exercises the transport boundary without
-    // requiring codecs or GPU drivers on the test host.
-    fs.writeFileSync(path.join(bin, 'ffmpeg'), `#!${process.execPath}
-const http = require('node:http');
-const zlib = require('node:zlib');
-const args = process.argv.slice(2);
-http.get(args[args.indexOf('-i') + 1], response => response.pipe(process.stdout));
-`, { mode: 0o755 });
     const hits = {};
     let base;
     const upstream = http.createServer((req, res) => {
         hits[req.url] = (hits[req.url] || 0) + 1;
         if (req.url === '/playlist?secret=private') return res.end(`#EXTM3U\n#EXTINF:-1 tvg-id="test" tvg-name="Test" group-title="News",Test\n${base}/live.ts\n`);
         if (req.url === '/guide?secret=private') { res.setHeader('Content-Encoding', 'gzip'); return res.end(zlib.gzipSync('<?xml version="1.0"?><tv><programme channel="test" start="20261118000000 +0000" stop="20261119000000 +0000"><title>Test show</title></programme></tv>')); }
-        if (req.url === '/live.ts') return res.end('proxied-stream-payload');
+        if (req.url === '/live.ts') {
+            assert.equal(req.headers['user-agent'], 'ViniPlay/Integration');
+            return res.end(fixture.stdout);
+        }
         res.writeHead(404).end();
     });
     t.after(() => { upstream.closeAllConnections(); upstream.close(); });
@@ -34,7 +35,7 @@ http.get(args[args.indexOf('-i') + 1], response => response.pipe(process.stdout)
     base = `http://127.0.0.1:${upstream.address().port}`;
     const child = spawn(process.execPath, [path.resolve(__dirname, '../server.js')], {
         cwd: dir,
-        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, M3U_URL: `${base}/playlist?secret=private`, EPG_URL: `${base}/guide?secret=private` },
+        env: { ...process.env, M3U_URL: `${base}/playlist?secret=private`, EPG_URL: `${base}/guide?secret=private`, STREAM_USER_AGENT: 'ViniPlay/Integration' },
         stdio: ['ignore', 'pipe', 'pipe']
     });
     let logs = '';
@@ -75,9 +76,25 @@ http.get(args[args.indexOf('-i') + 1], response => response.pipe(process.stdout)
     const stream = await fetch(app + `/stream?url=${encodeURIComponent(base + '/live.ts')}`, { redirect: 'manual' });
     assert.equal(stream.status, 200);
     assert.equal(stream.headers.get('location'), null);
-    assert.equal(await stream.text(), 'proxied-stream-payload');
+    assert.deepEqual(Buffer.from(await stream.arrayBuffer()), fixture.stdout);
+    const castUrl = app + `/stream?url=${encodeURIComponent(base + '/live.ts')}&profileId=cast-default`;
+    const hitCount = hits['/live.ts'];
+    const castProbe = await fetch(castUrl, { method: 'HEAD' });
+    assert.equal(castProbe.headers.get('content-type'), 'video/mp4');
+    assert.equal(hits['/live.ts'], hitCount, 'Cast HEAD must not open an upstream connection');
+    const cast = await fetch(castUrl);
+    assert.equal(cast.status, 200);
+    assert.equal(cast.headers.get('content-type'), 'video/mp4');
+    const mp4 = Buffer.from(await cast.arrayBuffer());
+    assert.equal(mp4.toString('ascii', 4, 8), 'ftyp');
+    assert.ok(mp4.includes(Buffer.from('moof')), 'Cast output must contain MP4 fragments');
+    const probeResult = spawnSync('ffprobe', [
+        '-v', 'error', '-show_entries', 'stream=codec_name', '-of', 'json', 'pipe:0'
+    ], { input: mp4 });
+    assert.equal(probeResult.status, 0, probeResult.error?.message || probeResult.stderr.toString());
+    assert.deepEqual(JSON.parse(probeResult.stdout).streams.map(stream => stream.codec_name), ['h264', 'aac']);
     assert.equal((await fetch(app + `/stream?url=${encodeURIComponent(base + '/live.ts')}&profileId=redirect`)).status, 404);
     assert.equal((await fetch(app + '/stream?url=http://unconfigured.test/private')).status, 404);
     assert.ok(hits['/playlist?secret=private'] >= 1 && hits['/guide?secret=private'] >= 1 && hits['/live.ts'] >= 1);
-    assert.deepEqual(fs.readdirSync(dir), ['bin']);
+    assert.deepEqual(fs.readdirSync(dir), []);
 });

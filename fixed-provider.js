@@ -1,5 +1,5 @@
 'use strict';
-const STREAM_PROFILE = Object.freeze({ id: 'ffmpeg-default', name: 'Server Proxy', command: 'server-mpegts', isDefault: true });
+const STREAM_PROFILE = Object.freeze({ id: 'proxy-default', name: 'Server Proxy', command: 'server-mpegts', isDefault: true });
 const CAST_PROFILE = Object.freeze({ id: 'cast-default', name: 'Cast Proxy', command: 'server-mp4', isDefault: true });
 
 function loadProvider(env) {
@@ -13,7 +13,7 @@ function loadProvider(env) {
     }
     const refreshHours = Number(env.SOURCE_REFRESH_HOURS || 24);
     if (!Number.isFinite(refreshHours) || refreshHours <= 0 || refreshHours > 596) throw new Error('SOURCE_REFRESH_HOURS must be greater than 0 and at most 596.');
-    return Object.freeze({ ...urls, refreshHours });
+    return Object.freeze({ ...urls, refreshHours, streamUserAgent: env.STREAM_USER_AGENT || 'ViniPlay/1.0' });
 }
 function clientSettings(updatedAt) {
     return {

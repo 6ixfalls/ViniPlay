@@ -13,7 +13,8 @@ test('startup requires HTTP(S) feeds and a bounded refresh interval', () => {
 });
 test('client configuration exposes fixed proxy profiles without provider URLs or persistence settings', () => {
     const settings = clientSettings('2026-11-19T00:00:00Z');
-    assert.equal(settings.activeStreamProfileId, 'ffmpeg-default');
+    assert.equal(settings.activeStreamProfileId, 'proxy-default');
+    assert.equal(settings.castProfiles[0].command, 'server-mp4');
     assert.ok(settings.streamProfiles.every(profile => profile.command !== 'redirect'));
     for (const key of ['forceProxy', 'directPlayEnabled', 'vodDirectPlayEnabled', 'dvr', 'generatedSessionSecret']) assert.ok(!(key in settings));
     assert.ok(!JSON.stringify(settings).includes('private.test'));
